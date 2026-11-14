@@ -14,8 +14,8 @@ use embassy_usb::driver::EndpointError;
 use embassy_usb::{Builder, Config as UsbConfig, UsbDevice};
 use heapless::Vec;
 use proto_native::{
-    MAX_CHUNK_BYTES, ProtoError, Request, Response, SD_FORMAT_CONFIRM_MAGIC, decode_frame,
-    encode_frame,
+    KnockStatusReport, MAX_CHUNK_BYTES, ProtoError, Request, Response, SD_FORMAT_CONFIRM_MAGIC,
+    decode_frame, encode_frame,
 };
 use proto_tunerstudio::{
     TS_ERR_OUT_OF_RANGE, TS_FLAG_BURN_OK, TS_PAGE_SIZE, handle_ts_packet,
@@ -479,6 +479,19 @@ async fn dispatch_native_request(
         },
         Request::TriggerLogMark => {
             trigger_mark_event();
+            Response::Ack
+        }
+        Request::GetKnockStatus => {
+            let overruns = crate::knock_hw::overrun_count();
+            let state = ECU_STATE.lock().await;
+            Response::KnockStatus(KnockStatusReport {
+                config: state.ecu.knock_config(),
+                telemetry: state.ecu.knock_telemetry(overruns),
+            })
+        }
+        Request::SetKnockConfig { config } => {
+            crate::knock_hw::set_hw_enabled(config.enabled);
+            ECU_STATE.lock().await.ecu.set_knock_config(config);
             Response::Ack
         }
     }

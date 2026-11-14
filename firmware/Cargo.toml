@@ -16,7 +16,6 @@ embassy-time = { version = "0.5.1", features = ["defmt", "defmt-timestamp-uptime
 embassy-stm32 = { version = "0.6.0", features = [
     "stm32h743vi",
     "time-driver-tim5",
-    "memory-x",
     "exti",
     "unstable-pac",
     "defmt",

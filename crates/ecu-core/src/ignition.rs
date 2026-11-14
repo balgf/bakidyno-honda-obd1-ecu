@@ -40,6 +40,16 @@ impl IgnitionModel {
         }
     }
 
+    #[inline]
+    pub const fn per_cyl_knock_retard_deg_x10(&self) -> [i16; 4] {
+        self.per_cyl_knock_retard_deg_x10
+    }
+
+    #[inline]
+    pub fn set_per_cyl_knock_retard_deg_x10(&mut self, retard_deg_x10: [i16; 4]) {
+        self.per_cyl_knock_retard_deg_x10 = retard_deg_x10;
+    }
+
     /// Computes base spark advance (`0.1° BTDC`) and Smart COP dwell (`µs`) at `1 kHz`.
     pub fn compute_1khz(
         &self,

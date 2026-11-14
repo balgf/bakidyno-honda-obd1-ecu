@@ -13,6 +13,7 @@ pub mod engine;
 pub mod fat32;
 pub mod fuel;
 pub mod ignition;
+pub mod knock;
 pub mod math;
 pub mod sensors;
 pub mod trigger;

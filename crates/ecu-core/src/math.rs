@@ -26,6 +26,61 @@ pub fn ln_f32(x: f32) -> f32 {
     (exp as f32) * LN_2 + 2.0 * poly
 }
 
+/// Pure `no_std` `(sin(x), cos(x))` approximation accurate to `< 1e-6` for filter synthesis.
+#[inline]
+pub fn sin_cos_f32(radians: f32) -> (f32, f32) {
+    use core::f32::consts::{FRAC_PI_2, PI, TAU};
+
+    if radians.is_nan() || radians.is_infinite() {
+        return (0.0, 1.0);
+    }
+    // Fold into [-PI, PI]
+    let k = (radians / TAU) as i32;
+    let mut x = radians - (k as f32) * TAU;
+    if x > PI {
+        x -= TAU;
+    } else if x < -PI {
+        x += TAU;
+    }
+
+    // Reduce into [-PI/2, PI/2] with sign flip for cosine on outer quadrants
+    let (xr, cos_sign) = if x > FRAC_PI_2 {
+        (PI - x, -1.0)
+    } else if x < -FRAC_PI_2 {
+        (-PI - x, -1.0)
+    } else {
+        (x, 1.0)
+    };
+
+    let x2 = xr * xr;
+    let sin_x = xr
+        * (1.0
+            - x2 * ((1.0 / 6.0)
+                - x2 * ((1.0 / 120.0) - x2 * ((1.0 / 5_040.0) - x2 * (1.0 / 362_880.0)))));
+    let cos_mag = 1.0
+        - x2 * (0.5
+            - x2 * ((1.0 / 24.0)
+                - x2 * ((1.0 / 720.0) - x2 * ((1.0 / 40_320.0) - x2 * (1.0 / 3_628_800.0)))));
+    (sin_x, cos_sign * cos_mag)
+}
+
+/// Pure `no_std` square root for non-negative `f32` via IEEE-754 half-exponent seed + 4 Newton
+/// iterations (relative error `< 1e-6`).
+#[inline]
+pub fn sqrt_f32(x: f32) -> f32 {
+    if x <= 0.0 || x.is_nan() {
+        return 0.0;
+    }
+    let half = 0.5 * x;
+    let i = 0x1fbd_1df5_u32.wrapping_add(x.to_bits() >> 1);
+    let mut y = f32::from_bits(i);
+    // Newton iterations on y ~= sqrt(x): y_{n+1} = 0.5 * (y + x / y)
+    y = 0.5 * y + half / y;
+    y = 0.5 * y + half / y;
+    y = 0.5 * y + half / y;
+    0.5 * y + half / y
+}
+
 /// Finds `(lower_idx, upper_idx, frac_0_to_1)` along a strictly increasing `u16` axis.
 #[inline]
 pub fn find_axis_u16<const N: usize>(bins: &[u16; N], x: f32) -> (usize, usize, f32) {

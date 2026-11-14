@@ -14,8 +14,8 @@ use ecu_core::datalog::{
 use ecu_core::sensors::{ADC_FULL_SCALE, VREF_VOLTS};
 use ecu_types::{CalibrationBlob, FaultFlags, RawSensorAdc, SwitchState, crc32};
 use proto_native::{
-    MAX_CHUNK_BYTES, MAX_FRAME_BYTES, ProtoError, Request, Response, SD_FORMAT_CONFIRM_MAGIC,
-    SdDiskKind, SdStatusReport, decode_frame, encode_frame,
+    KnockConfig, KnockStatusReport, MAX_CHUNK_BYTES, MAX_FRAME_BYTES, ProtoError, Request,
+    Response, SD_FORMAT_CONFIRM_MAGIC, SdDiskKind, SdStatusReport, decode_frame, encode_frame,
 };
 use proto_tunerstudio::{
     TS_FLAG_BURN_OK, TS_FLAG_OK, TS_OCH_SIZE, TS_PAGE_SIZE, TS_PROTO_VERSION, TS_SIGNATURE,
@@ -92,6 +92,32 @@ enum Commands {
         /// Optional fixed UTC offset in hours (e.g. `8`); defaults to local system offset
         #[arg(long)]
         tz_offset_hours: Option<i8>,
+    },
+    /// Query live ADC3 Knock Window DSP config, per-cylinder RMS, noise floor, and retard
+    KnockStatus {
+        #[arg(long, default_value = "/dev/ttyACM0")]
+        port: String,
+    },
+    /// Update runtime Knock Window DSP configuration in ECU RAM over `proto-native`
+    KnockCfg {
+        #[arg(long, default_value = "/dev/ttyACM0")]
+        port: String,
+        #[arg(long)]
+        enabled: Option<bool>,
+        #[arg(long)]
+        retard_enabled: Option<bool>,
+        #[arg(long)]
+        sensor_diag: Option<bool>,
+        #[arg(long)]
+        freq_hz: Option<u16>,
+        #[arg(long)]
+        min_rpm: Option<u16>,
+        #[arg(long)]
+        threshold_x100: Option<u16>,
+        #[arg(long)]
+        step_deg_x10: Option<i16>,
+        #[arg(long)]
+        max_deg_x10: Option<i16>,
     },
 }
 
@@ -1113,6 +1139,139 @@ fn run_rtc_sync(port_path: &str, tz_offset_hours: Option<i8>) -> Result<()> {
     Ok(())
 }
 
+fn print_knock_status(st: &KnockStatusReport) {
+    let t = &st.telemetry;
+    let c = &st.config;
+    println!("Honda OBD1 Knock Window DSP (ADC3 PC2_C @ 200 kS/s BDMA -> SRAM4)");
+    println!("==================================================================");
+    println!(
+        "Config   : enabled={} retard={} diag={} center={}Hz Q={:.1} win={:.1}..{:.1}deg \
+         min_rpm={} thr={:.2}x step={:.1}deg max={:.1}deg",
+        c.enabled,
+        c.retard_enabled,
+        c.sensor_diag_enabled,
+        c.center_freq_hz,
+        f32::from(c.q_x10) / 10.0,
+        f32::from(c.window_start_deg_x10) / 10.0,
+        f32::from(c.window_end_deg_x10) / 10.0,
+        c.min_rpm,
+        f32::from(c.threshold_ratio_x100) / 100.0,
+        f32::from(c.step_retard_deg_x10) / 10.0,
+        f32::from(c.max_retard_deg_x10) / 10.0
+    );
+    println!(
+        "Activity : windows={} overruns={} fault={} last=Cyl{} rpm={} n={} dc_mean={}",
+        t.window_count,
+        t.capture_overruns,
+        t.sensor_fault,
+        t.last_cylinder + 1,
+        t.last_rpm,
+        t.last_sample_count,
+        t.last_dc_mean_counts
+    );
+    for cyl in 0..4 {
+        println!(
+            "  Cyl {}  : rms={:>5} floor={:>5} events={:>4} retard={:.1} deg",
+            cyl + 1,
+            t.per_cyl_rms_counts[cyl],
+            t.per_cyl_noise_floor_counts[cyl],
+            t.per_cyl_knock_events[cyl],
+            f32::from(t.per_cyl_retard_deg_x10[cyl]) / 10.0
+        );
+    }
+    println!("RPM Floor: {:?}", t.rpm_noise_bins_counts);
+}
+
+#[allow(clippy::too_many_arguments)]
+fn apply_knock_cfg_overrides(
+    mut cfg: KnockConfig,
+    enabled: Option<bool>,
+    retard_enabled: Option<bool>,
+    sensor_diag: Option<bool>,
+    freq_hz: Option<u16>,
+    min_rpm: Option<u16>,
+    threshold_x100: Option<u16>,
+    step_deg_x10: Option<i16>,
+    max_deg_x10: Option<i16>,
+) -> KnockConfig {
+    if let Some(v) = enabled {
+        cfg.enabled = v;
+    }
+    if let Some(v) = retard_enabled {
+        cfg.retard_enabled = v;
+    }
+    if let Some(v) = sensor_diag {
+        cfg.sensor_diag_enabled = v;
+    }
+    if let Some(v) = freq_hz {
+        cfg.center_freq_hz = v;
+    }
+    if let Some(v) = min_rpm {
+        cfg.min_rpm = v;
+    }
+    if let Some(v) = threshold_x100 {
+        cfg.threshold_ratio_x100 = v;
+    }
+    if let Some(v) = step_deg_x10 {
+        cfg.step_retard_deg_x10 = v;
+    }
+    if let Some(v) = max_deg_x10 {
+        cfg.max_retard_deg_x10 = v;
+    }
+    cfg
+}
+
+fn fetch_knock_status(port: &mut File) -> Result<KnockStatusReport> {
+    match native_rpc(port, &Request::GetKnockStatus)? {
+        Response::KnockStatus(report) => Ok(report),
+        Response::Error(err) => bail!("GetKnockStatus failed: {err:?}"),
+        other => bail!("unexpected GetKnockStatus response: {other:?}"),
+    }
+}
+
+fn run_knock_status(port_path: &str) -> Result<()> {
+    let mut port = open_serial(port_path)?;
+    let report = fetch_knock_status(&mut port)?;
+    print_knock_status(&report);
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_knock_cfg(
+    port_path: &str,
+    enabled: Option<bool>,
+    retard_enabled: Option<bool>,
+    sensor_diag: Option<bool>,
+    freq_hz: Option<u16>,
+    min_rpm: Option<u16>,
+    threshold_x100: Option<u16>,
+    step_deg_x10: Option<i16>,
+    max_deg_x10: Option<i16>,
+) -> Result<()> {
+    let mut port = open_serial(port_path)?;
+    let current = fetch_knock_status(&mut port)?;
+    let updated = apply_knock_cfg_overrides(
+        current.config,
+        enabled,
+        retard_enabled,
+        sensor_diag,
+        freq_hz,
+        min_rpm,
+        threshold_x100,
+        step_deg_x10,
+        max_deg_x10,
+    );
+    match native_rpc(&mut port, &Request::SetKnockConfig { config: updated })? {
+        Response::Ack => {
+            let confirmed = fetch_knock_status(&mut port)?;
+            print_knock_status(&confirmed);
+            Ok(())
+        }
+        Response::Error(err) => bail!("SetKnockConfig failed: {err:?}"),
+        other => bail!("unexpected SetKnockConfig response: {other:?}"),
+    }
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
@@ -1130,6 +1289,28 @@ fn main() -> Result<()> {
             port,
             tz_offset_hours,
         } => run_rtc_sync(&port, tz_offset_hours),
+        Commands::KnockStatus { port } => run_knock_status(&port),
+        Commands::KnockCfg {
+            port,
+            enabled,
+            retard_enabled,
+            sensor_diag,
+            freq_hz,
+            min_rpm,
+            threshold_x100,
+            step_deg_x10,
+            max_deg_x10,
+        } => run_knock_cfg(
+            &port,
+            enabled,
+            retard_enabled,
+            sensor_diag,
+            freq_hz,
+            min_rpm,
+            threshold_x100,
+            step_deg_x10,
+            max_deg_x10,
+        ),
     }
 }
 

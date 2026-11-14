@@ -2,14 +2,15 @@
 
 use crate::fuel::{FuelModel, InjScheduleBatch};
 use crate::ignition::{IgnitionModel, ToothScheduleBatch};
+use crate::knock::KnockDetector;
 use crate::math::interp_1d_i16_u16;
 use crate::sensors::SensorProcessor;
 use crate::trigger::{CkpToothEvent, HondaObd1Decoder};
 use crate::vtec::VtecController;
 use crate::wideband::Lsu49Controller;
 use ecu_types::{
-    ActuatorOutputs, CalibrationBlob, FaultFlags, RawSensorAdc, SensorSnapshot, SwitchState,
-    SyncState, TelemetrySnapshot,
+    ActuatorOutputs, CalibrationBlob, Cylinder, FaultFlags, KnockConfig, KnockTelemetry,
+    RawSensorAdc, SensorSnapshot, SwitchState, SyncState, TelemetrySnapshot,
 };
 
 /// Combined ignition & injector compare actions emitted on a single `CKP` tooth edge.
@@ -27,6 +28,7 @@ pub struct EngineCoordinator {
     pub wideband: Lsu49Controller,
     pub fuel: FuelModel,
     pub ignition: IgnitionModel,
+    pub knock: KnockDetector,
 
     uptime_ms: u32,
     seq: u32,
@@ -57,6 +59,7 @@ impl EngineCoordinator {
             wideband: Lsu49Controller::new(),
             fuel: FuelModel::new(),
             ignition: IgnitionModel::new(),
+            knock: KnockDetector::new(),
             uptime_ms: 0,
             seq: 0,
             last_angle_deg_x10: 0,
@@ -104,6 +107,26 @@ impl EngineCoordinator {
     #[inline]
     pub fn set_timing_override_deg_x10(&mut self, override_deg_x10: Option<i16>) {
         self.timing_override_deg_x10 = override_deg_x10;
+    }
+
+    #[inline]
+    pub fn process_knock_window(&mut self, cyl: Cylinder, rpm: u16, samples: &[u16]) -> bool {
+        self.knock.process_window(cyl, rpm, samples)
+    }
+
+    #[inline]
+    pub fn set_knock_config(&mut self, cfg: KnockConfig) {
+        self.knock.set_config(cfg);
+    }
+
+    #[inline]
+    pub const fn knock_config(&self) -> KnockConfig {
+        self.knock.config()
+    }
+
+    #[inline]
+    pub fn knock_telemetry(&self, capture_overruns: u32) -> KnockTelemetry {
+        self.knock.telemetry(capture_overruns)
     }
 
     #[inline]
@@ -207,7 +230,18 @@ impl EngineCoordinator {
             cal,
         );
 
-        // 5. Ignition Advance + Smart COP Dwell
+        // 5. Knock DSP 1 kHz Decay/Fault Update + Ignition Advance + Smart COP Dwell
+        let engine_unsynced = self.trigger.sync_state() == SyncState::Unsynced;
+        self.knock
+            .tick_1khz(engine_unsynced, &mut self.latest_faults);
+        let suppress_knock_retard =
+            switches.scs_service_jumper || self.timing_override_deg_x10.is_some();
+        self.ignition
+            .set_per_cyl_knock_retard_deg_x10(if suppress_knock_retard {
+                [0; 4]
+            } else {
+                self.knock.per_cyl_retard_deg_x10()
+            });
         let (spark_advance_deg_x10, cop_dwell_us) = self.ignition.compute_1khz(
             rpm,
             use_vtec_maps,

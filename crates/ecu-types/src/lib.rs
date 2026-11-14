@@ -130,6 +130,11 @@ impl FaultFlags {
     }
 
     #[inline]
+    pub fn remove(&mut self, bit: u32) {
+        self.0 &= !bit;
+    }
+
+    #[inline]
     pub const fn contains(self, bit: u32) -> bool {
         (self.0 & bit) != 0
     }
@@ -433,6 +438,98 @@ impl CalibrationBlob {
     pub const fn validate_header(&self) -> bool {
         self.magic == CALIBRATION_MAGIC && self.version == CALIBRATION_VERSION
     }
+}
+
+/// Runtime-tunable Knock Window DSP configuration (kept independent of `CalibrationBlob` so
+/// TunerStudio page layout and NVM calibration size remain ABI-stable).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+pub struct KnockConfig {
+    /// Enables `ADC3` (`PC2_C`) combustion-window capture and `~7.5 kHz` DSP analysis.
+    pub enabled: bool,
+    /// Applies per-cylinder knock retard feedback to `IgnitionModel` (`false` = monitor only).
+    pub retard_enabled: bool,
+    /// Checks biased sensor front-end DC plausibility for `FaultFlags::KNOCK_SENSOR` (Code 23).
+    pub sensor_diag_enabled: bool,
+    /// Bandpass center frequency in `Hz` (default `7_500 Hz` for OEM Honda resonant piezo).
+    pub center_freq_hz: u16,
+    /// Biquad quality factor `Q * 10` (default `40` -> `Q = 4.0`, `-3 dB` BW `~1.9 kHz`).
+    pub q_x10: u16,
+    /// Combustion window start angle ATDC in `0.1°` crank units (default `100` = `10.0° ATDC`).
+    pub window_start_deg_x10: u16,
+    /// Combustion window end angle ATDC in `0.1°` crank units (default `500` = `50.0° ATDC`).
+    pub window_end_deg_x10: u16,
+    /// Minimum engine speed (`RPM`) above which knock windows are captured and evaluated.
+    pub min_rpm: u16,
+    /// Knock detection ratio `threshold * 100` above the RPM adaptive noise floor (`250` = `2.50x`).
+    pub threshold_ratio_x100: u16,
+    /// Minimum absolute bandpass RMS (`16-bit ADC counts`) before knock can trigger (`250` ~ `13 mV`).
+    pub min_abs_rms_counts: u16,
+    /// Per-event retard step applied to the knocking cylinder (`0.1°`, e.g. `15` = `1.5°`).
+    pub step_retard_deg_x10: i16,
+    /// Maximum allowed knock retard per cylinder (`0.1°`, e.g. `80` = `8.0°`).
+    pub max_retard_deg_x10: i16,
+    /// Hold time (`ms`) after the last knock event before retard starts decaying.
+    pub recovery_hold_ms: u16,
+    /// Milliseconds required to recover `0.1°` of retard after `recovery_hold_ms` elapses.
+    pub decay_ms_per_0_1deg: u16,
+    /// Lower DC bias bound (`16-bit counts`) when `sensor_diag_enabled == true`.
+    pub diag_min_dc_counts: u16,
+    /// Upper DC bias bound (`16-bit counts`) when `sensor_diag_enabled == true`.
+    pub diag_max_dc_counts: u16,
+}
+
+impl Default for KnockConfig {
+    fn default() -> Self {
+        Self::default_honda_obd1()
+    }
+}
+
+impl KnockConfig {
+    pub const fn default_honda_obd1() -> Self {
+        Self {
+            enabled: true,
+            retard_enabled: true,
+            sensor_diag_enabled: false,
+            center_freq_hz: 7_500,
+            q_x10: 40,
+            window_start_deg_x10: 100,
+            window_end_deg_x10: 500,
+            min_rpm: 1_200,
+            threshold_ratio_x100: 250,
+            min_abs_rms_counts: 250,
+            step_retard_deg_x10: 15,
+            max_retard_deg_x10: 80,
+            recovery_hold_ms: 400,
+            decay_ms_per_0_1deg: 150,
+            diag_min_dc_counts: 3_000,
+            diag_max_dc_counts: 62_000,
+        }
+    }
+}
+
+/// Live Knock Window DSP diagnostics & per-cylinder retard telemetry.
+///
+/// Array fields (`per_cyl_*`) are indexed by [`Cylinder::index()`] (`0=Cyl1, 1=Cyl2, 2=Cyl3, 3=Cyl4`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+pub struct KnockTelemetry {
+    pub enabled: bool,
+    pub retard_enabled: bool,
+    pub sensor_fault: bool,
+    /// Most recently processed cylinder index (`0=Cyl1 .. 3=Cyl4`).
+    pub last_cylinder: u8,
+    pub center_freq_hz: u16,
+    pub last_rpm: u16,
+    pub last_sample_count: u16,
+    pub last_dc_mean_counts: u16,
+    pub per_cyl_rms_counts: [u16; 4],
+    pub per_cyl_noise_floor_counts: [u16; 4],
+    pub per_cyl_knock_events: [u32; 4],
+    pub per_cyl_retard_deg_x10: [i16; 4],
+    pub rpm_noise_bins_counts: [u16; 8],
+    pub window_count: u32,
+    pub capture_overruns: u32,
 }
 
 /// Computes IEEE 802.3 CRC-32 over an arbitrary byte slice.

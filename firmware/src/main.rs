@@ -13,6 +13,7 @@
 mod aux_io_hw;
 mod can_hw;
 mod dlc_hw;
+mod knock_hw;
 mod nvm;
 mod outputs;
 mod sd_logger_hw;
@@ -53,6 +54,8 @@ bind_interrupts!(struct Irqs {
     TIM1_CC => outputs::Tim1CopInterruptHandler;
     TIM3 => outputs::Tim3InjInterruptHandler;
     TIM15 => wideband_hw::Tim15WidebandInterruptHandler;
+    TIM7 => knock_hw::Tim7KnockInterruptHandler;
+    BDMA_CHANNEL0 => knock_hw::BdmaCh0KnockInterruptHandler;
     DMA1_STREAM0 => dma::InterruptHandler<peripherals::DMA1_CH0>;
     OTG_FS => usb::InterruptHandler<peripherals::USB_OTG_FS>;
     FDCAN1_IT0 => can::IT0InterruptHandler<peripherals::FDCAN1>;
@@ -198,8 +201,11 @@ async fn tim2_trigger_task(mut tim2_ic: InputCapture<'static, peripherals::TIM2>
         let state_ref = &mut *state;
         if let Some(ref cal) = state_ref.cal {
             let tooth_out = state_ref.ecu.on_ckp_capture(ckp_ts_us, cal);
-            if tooth_out.event.is_some() {
+            if let Some(ev) = tooth_out.event {
                 HardwareOutputs::schedule_tooth_outputs(ckp_ts_us, &tooth_out.cop, &tooth_out.inj);
+                if let Some(plan) = state_ref.ecu.knock.plan_on_ckp_tooth(&ev) {
+                    knock_hw::schedule_window(plan);
+                }
             }
         }
     }
@@ -284,6 +290,16 @@ async fn main(spawner: Spawner) {
         tim17: p.TIM17,
         pb9_heater_pwm: p.PB9,
     });
+    let _knock_hw = knock_hw::KnockHw::init(
+        knock_hw::KnockPeripherals {
+            adc3: p.ADC3,
+            bdma_ch0: p.BDMA_CH0,
+            tim6: p.TIM6,
+            tim7: p.TIM7,
+            pc2: p.PC2,
+        },
+        Irqs,
+    );
 
     // 5. Load calibration from `SPI1` NOR Flash (or default map) & spawn trigger + USB CDC tasks
     let mut boot_page_buf = [0u8; TS_PAGE_SIZE];
@@ -344,6 +360,7 @@ async fn main(spawner: Spawner) {
         spawner.spawn(dlc_hw::dlc_uart_task(uart).expect("valid dlc_uart_task token"));
     }
     spawner.spawn(sd_logger_hw::sd_logger_task(sdmmc, pd4_detect).expect("valid sd_logger token"));
+    spawner.spawn(knock_hw::knock_dsp_task().expect("valid knock_dsp_task token"));
 
     // 6. All outputs verified safe -> Assert `PB15` (`ACTUATOR_OE_N`) LOW to arm low-side buffers!
     actuator_oe_n.set_low();
@@ -436,6 +453,13 @@ async fn main(spawner: Spawner) {
             let can_st = can_hw::stats();
             let dlc_cnt = dlc_hw::answered_frame_count();
             let sd_st = sd_logger_hw::status_report();
+            let knk_ov = knock_hw::overrun_count();
+            let knk_t = ECU_STATE.lock().await.ecu.knock_telemetry(knk_ov);
+            let knk_events = knk_t.per_cyl_knock_events[0]
+                + knk_t.per_cyl_knock_events[1]
+                + knk_t.per_cyl_knock_events[2]
+                + knk_t.per_cyl_knock_events[3];
+            let knk_max_ret = knk_t.per_cyl_retard_deg_x10.into_iter().max().unwrap_or(0);
             let eth_pct = if aux_snap.flex.is_valid() {
                 aux_snap.flex.ethanol_pct as i16
             } else {
@@ -450,7 +474,7 @@ async fn main(spawner: Spawner) {
                 "ECU 1Hz | up={}s | sync={} | rpm={} | adv={}deg | inj1={}us | spk={} | \
                  inj={} | tach={} | wd={} | flr={} | wb={} | ri={}ohm | lam={} | htr={} | \
                  eth={} | altf={} | aux=0x{=u8:02x} | can={}/{}/{}/{}/tec={} | dlc={} | \
-                 sd=on:{}/r:{}/d:{}/e:{}/mk:{} | flt=0x{=u32:08x}",
+                 knk=w:{}/o:{}/e:{}/r:{} | sd=on:{}/r:{}/d:{}/e:{}/mk:{} | flt=0x{=u32:08x}",
                 tick_count / 1_000,
                 snap.sync_state,
                 snap.rpm,
@@ -474,6 +498,10 @@ async fn main(spawner: Spawner) {
                 can_st.rx_count,
                 can_st.tec,
                 dlc_cnt,
+                knk_t.window_count,
+                knk_t.capture_overruns,
+                knk_events,
+                knk_max_ret,
                 sd_st.logging_active,
                 sd_st.records_logged,
                 sd_st.dropped_records,

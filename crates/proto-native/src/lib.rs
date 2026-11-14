@@ -3,6 +3,7 @@
 //! Native framed RPC protocol (`postcard` + `CRC32` + `COBS` `0x00` packet delimiter)
 //! shared by `firmware`, `ecu-cli`, and our future custom Rust `tuner-gui`.
 
+pub use ecu_types::{KnockConfig, KnockTelemetry};
 use ecu_types::{TelemetrySnapshot, crc32};
 use heapless::Vec;
 use serde::{Deserialize, Serialize};
@@ -119,6 +120,20 @@ pub enum Request {
     },
     /// Triggers a manual datalog mark event over USB RPC (equivalent to `PC13` `KEY` button press).
     TriggerLogMark,
+    /// Reads live `ADC3` Knock Window DSP configuration, per-cylinder RMS/floor/retard, and stats.
+    GetKnockStatus,
+    /// Updates runtime `ADC3` Knock Window DSP configuration (takes effect immediately in RAM).
+    SetKnockConfig {
+        config: KnockConfig,
+    },
+}
+
+/// Live Knock Window DSP config & telemetry snapshot returned by [`Request::GetKnockStatus`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+pub struct KnockStatusReport {
+    pub config: KnockConfig,
+    pub telemetry: KnockTelemetry,
 }
 
 /// ECU-to-Host RPC response (`no_std` stack-allocated; `Box` intentionally avoided).
@@ -148,6 +163,7 @@ pub enum Response {
         total_size: u32,
         data: Vec<u8, MAX_CHUNK_BYTES>,
     },
+    KnockStatus(KnockStatusReport),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -277,15 +293,15 @@ pub fn decode_frame<T: for<'de> Deserialize<'de>>(frame: &[u8]) -> Result<T, Pro
 #[cfg(test)]
 mod tests {
     use ecu_types::{
-        ActuatorOutputs, FaultFlags, SensorSnapshot, SyncState, TelemetrySnapshot, VtecState,
-        WidebandState,
+        ActuatorOutputs, FaultFlags, KnockConfig, KnockTelemetry, SensorSnapshot, SyncState,
+        TelemetrySnapshot, VtecState, WidebandState,
     };
     use heapless::Vec;
 
     use super::{
-        MAX_CHUNK_BYTES, MAX_FRAME_BYTES, ProtoError, Request, Response, SD_FORMAT_CONFIRM_MAGIC,
-        SdDirEntry, SdDiskKind, SdStatusReport, cobs_decode, cobs_encode_with_delimiter,
-        decode_frame, encode_frame,
+        KnockStatusReport, MAX_CHUNK_BYTES, MAX_FRAME_BYTES, ProtoError, Request, Response,
+        SD_FORMAT_CONFIRM_MAGIC, SdDirEntry, SdDiskKind, SdStatusReport, cobs_decode,
+        cobs_encode_with_delimiter, decode_frame, encode_frame,
     };
 
     #[test]
@@ -433,5 +449,33 @@ mod tests {
         };
         let clen = encode_frame(&c_resp, &mut wire).expect("encode max SdFileChunk");
         assert_eq!(decode_frame::<Response>(&wire[..clen]), Ok(c_resp));
+
+        let knock_cfg = KnockConfig::default_honda_obd1();
+        let k_req = Request::SetKnockConfig { config: knock_cfg };
+        let klen = encode_frame(&k_req, &mut wire).expect("encode SetKnockConfig");
+        assert_eq!(decode_frame::<Request>(&wire[..klen]), Ok(k_req));
+
+        let k_resp = Response::KnockStatus(KnockStatusReport {
+            config: knock_cfg,
+            telemetry: KnockTelemetry {
+                enabled: true,
+                retard_enabled: true,
+                sensor_fault: false,
+                last_cylinder: 2,
+                center_freq_hz: 7_500,
+                last_rpm: 5_200,
+                last_sample_count: 256,
+                last_dc_mean_counts: 32_768,
+                per_cyl_rms_counts: [140, 130, 2_800, 150],
+                per_cyl_noise_floor_counts: [250; 4],
+                per_cyl_knock_events: [0, 0, 3, 0],
+                per_cyl_retard_deg_x10: [0, 0, 45, 0],
+                rpm_noise_bins_counts: [250; 8],
+                window_count: 1_024,
+                capture_overruns: 0,
+            },
+        });
+        let krlen = encode_frame(&k_resp, &mut wire).expect("encode KnockStatus");
+        assert_eq!(decode_frame::<Response>(&wire[..krlen]), Ok(k_resp));
     }
 }
