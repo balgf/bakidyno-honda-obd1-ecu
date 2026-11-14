@@ -13,7 +13,10 @@ use embassy_usb::class::cdc_acm::{CdcAcmClass, State as CdcState};
 use embassy_usb::driver::EndpointError;
 use embassy_usb::{Builder, Config as UsbConfig, UsbDevice};
 use heapless::Vec;
-use proto_native::{MAX_CHUNK_BYTES, ProtoError, Request, Response, decode_frame, encode_frame};
+use proto_native::{
+    MAX_CHUNK_BYTES, ProtoError, Request, Response, SD_FORMAT_CONFIRM_MAGIC, decode_frame,
+    encode_frame,
+};
 use proto_tunerstudio::{
     TS_ERR_OUT_OF_RANGE, TS_FLAG_BURN_OK, TS_PAGE_SIZE, handle_ts_packet,
     handle_ts_packet_with_cal, handle_ts_raw_probe, pack_page, unpack_page_into, wrap_ts_envelope,
@@ -22,6 +25,10 @@ use static_cell::StaticCell;
 
 use crate::ECU_STATE;
 use crate::nvm::NvmFlash;
+use crate::sd_logger_hw::{
+    SdCmd, SdCmdReply, parse_rpc_filename, run_sd_command, set_rtc_datetime, status_report,
+    trigger_mark_event, update_cal_crc,
+};
 
 const USB_MAX_PACKET_SIZE: usize = 64;
 const MAX_RX_BUF: usize = 600;
@@ -387,6 +394,8 @@ async fn dispatch_native_request(
             let Some(ref cal) = cal_opt else {
                 return Response::Error(ProtoError::NvmWriteFailed);
             };
+            pack_page(cal, page_buf);
+            update_cal_crc(ecu_types::crc32(page_buf));
             match nvm.save_calibration(cal, page_buf).await {
                 Ok(()) => Response::Ack,
                 Err(_) => Response::Error(ProtoError::NvmWriteFailed),
@@ -398,6 +407,78 @@ async fn dispatch_native_request(
                 .await
                 .ecu
                 .set_timing_override_deg_x10(advance_deg_x10);
+            Response::Ack
+        }
+        Request::GetSdStatus => Response::SdStatus(status_report()),
+        Request::ListSdFiles { offset } => {
+            match run_sd_command(SdCmd::ListFiles { offset }, 3_000).await {
+                SdCmdReply::FileList {
+                    total_files,
+                    entries,
+                } => Response::SdFileList {
+                    total_files,
+                    entries,
+                },
+                SdCmdReply::Err(err) => Response::Error(err),
+                _ => Response::Error(ProtoError::SdIoFailed),
+            }
+        }
+        Request::FormatSdFat32 { confirm_magic } => {
+            if confirm_magic != SD_FORMAT_CONFIRM_MAGIC {
+                return Response::Error(ProtoError::OutOfBounds);
+            }
+            match run_sd_command(SdCmd::FormatFat32, 25_000).await {
+                SdCmdReply::Ok => Response::Ack,
+                SdCmdReply::Err(err) => Response::Error(err),
+                _ => Response::Error(ProtoError::SdIoFailed),
+            }
+        }
+        Request::ReadSdFileChunk {
+            name,
+            name_len,
+            offset,
+            len,
+        } => {
+            let Some(name_8_3) = parse_rpc_filename(&name, name_len) else {
+                return Response::Error(ProtoError::OutOfBounds);
+            };
+            match run_sd_command(
+                SdCmd::ReadFileChunk {
+                    name_8_3,
+                    offset,
+                    len,
+                },
+                3_000,
+            )
+            .await
+            {
+                SdCmdReply::FileChunk {
+                    offset,
+                    total_size,
+                    data,
+                } => Response::SdFileChunk {
+                    offset,
+                    total_size,
+                    data,
+                },
+                SdCmdReply::Err(err) => Response::Error(err),
+                _ => Response::Error(ProtoError::SdIoFailed),
+            }
+        }
+        Request::SetRtcDateTime {
+            year,
+            month,
+            day,
+            weekday,
+            hour,
+            minute,
+            second,
+        } => match set_rtc_datetime(year, month, day, weekday, hour, minute, second) {
+            Ok(()) => Response::Ack,
+            Err(err) => Response::Error(err),
+        },
+        Request::TriggerLogMark => {
+            trigger_mark_event();
             Response::Ack
         }
     }

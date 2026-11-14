@@ -7,8 +7,10 @@
 
 pub mod aux_io;
 pub mod can_bus;
+pub mod datalog;
 pub mod dlc;
 pub mod engine;
+pub mod fat32;
 pub mod fuel;
 pub mod ignition;
 pub mod math;

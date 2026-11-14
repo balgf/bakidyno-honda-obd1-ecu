@@ -1,14 +1,22 @@
-use std::fs::{File, OpenOptions};
+use std::fmt::Write as _;
+use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
+use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 use ecu_core::EngineCoordinator;
+use ecu_core::datalog::{
+    DatalogFileHeader, DatalogRecord, LOG_FLAG_MARK_EDGE, LOG_RECORD_BYTES, RtcTimestamp,
+};
 use ecu_core::sensors::{ADC_FULL_SCALE, VREF_VOLTS};
 use ecu_types::{CalibrationBlob, FaultFlags, RawSensorAdc, SwitchState, crc32};
-use proto_native::{MAX_FRAME_BYTES, Request, Response, decode_frame, encode_frame};
+use proto_native::{
+    MAX_CHUNK_BYTES, MAX_FRAME_BYTES, ProtoError, Request, Response, SD_FORMAT_CONFIRM_MAGIC,
+    SdDiskKind, SdStatusReport, decode_frame, encode_frame,
+};
 use proto_tunerstudio::{
     TS_FLAG_BURN_OK, TS_FLAG_OK, TS_OCH_SIZE, TS_PAGE_SIZE, TS_PROTO_VERSION, TS_SIGNATURE,
 };
@@ -42,6 +50,48 @@ enum Commands {
         port: String,
         #[arg(long)]
         burn_test: bool,
+    },
+    /// Query MicroSD card, FAT32 logger, PD4/PC13 pins, and LSE RTC status over `proto-native`
+    SdStatus {
+        #[arg(long, default_value = "/dev/ttyACM0")]
+        port: String,
+    },
+    /// Format the inserted MicroSD card cleanly as MBR + FAT32 (requires `--yes` and `RPM == 0`)
+    SdFormat {
+        #[arg(long, default_value = "/dev/ttyACM0")]
+        port: String,
+        /// Required explicit confirmation to wipe existing partition/FAT structures
+        #[arg(long)]
+        yes: bool,
+    },
+    /// List files in the FAT32 root directory on the ECU MicroSD card
+    SdLs {
+        #[arg(long, default_value = "/dev/ttyACM0")]
+        port: String,
+    },
+    /// Download a `.BDL` datalog (or root FAT32 file) from the ECU MicroSD card over USB CDC
+    SdPull {
+        /// Root 8.3 filename (for example `LOG00001.BDL`)
+        file: String,
+        /// Destination local file path
+        out: PathBuf,
+        #[arg(long, default_value = "/dev/ttyACM0")]
+        port: String,
+    },
+    /// Decode and CRC32-verify a `.BDL` binary datalog into MegaLogViewer / Tuner CSV
+    LogToCsv {
+        /// Input `.BDL` file pulled from SD card or via `sd-pull`
+        input: PathBuf,
+        /// Output `.csv` path
+        out: PathBuf,
+    },
+    /// Synchronize the STM32H743 LSE RTC date/time from host system time
+    RtcSync {
+        #[arg(long, default_value = "/dev/ttyACM0")]
+        port: String,
+        /// Optional fixed UTC offset in hours (e.g. `8`); defaults to local system offset
+        #[arg(long)]
+        tz_offset_hours: Option<i8>,
     },
 }
 
@@ -312,13 +362,13 @@ fn open_serial(port_path: &str) -> Result<File> {
         .with_context(|| format!("failed to open serial port {port_path}"))
 }
 
-fn native_rpc(port: &mut File, req: &Request) -> Result<Response> {
+fn native_rpc_with_timeout(port: &mut File, req: &Request, timeout: Duration) -> Result<Response> {
     let mut tx = [0u8; MAX_FRAME_BYTES];
     let n = encode_frame(req, &mut tx).map_err(|e| anyhow::anyhow!("encode error: {e:?}"))?;
     port.write_all(&tx[..n])?;
     port.flush()?;
 
-    let deadline = Instant::now() + Duration::from_secs(2);
+    let deadline = Instant::now() + timeout;
     let mut rx = Vec::with_capacity(MAX_FRAME_BYTES);
     let mut byte = [0u8; 64];
     loop {
@@ -334,6 +384,10 @@ fn native_rpc(port: &mut File, req: &Request) -> Result<Response> {
             return decode_frame(&rx[..=end]).map_err(|e| anyhow::anyhow!("decode error: {e:?}"));
         }
     }
+}
+
+fn native_rpc(port: &mut File, req: &Request) -> Result<Response> {
+    native_rpc_with_timeout(port, req, Duration::from_secs(2))
 }
 
 fn ts_rpc(port: &mut File, body: &[u8]) -> Result<(u8, Vec<u8>)> {
@@ -607,6 +661,458 @@ fn run_ts_check(port_path: &str, burn_test: bool) -> Result<()> {
     Ok(())
 }
 
+fn format_proto_error(err: ProtoError) -> &'static str {
+    match err {
+        ProtoError::SdNotReady => "MicroSD card not detected or not ready on SDMMC1",
+        ProtoError::SdBusy => "SD task busy (try again shortly)",
+        ProtoError::SdFormatRejectedEngineRunning => {
+            "format rejected because engine RPM > 0 (stop engine / dizzy simulator first)"
+        }
+        ProtoError::SdFileNotFound => "requested file not found in FAT32 root directory",
+        ProtoError::SdIoFailed => "MicroSD block I/O or FAT32 filesystem error",
+        ProtoError::OutOfBounds => "request parameter out of bounds",
+        _ => "protocol error",
+    }
+}
+
+fn format_disk_kind(kind: SdDiskKind) -> String {
+    match kind {
+        SdDiskKind::Unknown => "Unknown / Unread".to_string(),
+        SdDiskKind::Blank => "Blank (all-zero sector 0 — run sd-format --yes)".to_string(),
+        SdDiskKind::MbrFat32 => "MBR + FAT32 (ECU ready)".to_string(),
+        SdDiskKind::MbrExFat => {
+            "MBR + exFAT (typical SDXC 64GB factory format — run sd-format --yes)".to_string()
+        }
+        SdDiskKind::MbrNtfs => "MBR + NTFS (unsupported — run sd-format --yes)".to_string(),
+        SdDiskKind::MbrLinux => "MBR + Linux (unsupported — run sd-format --yes)".to_string(),
+        SdDiskKind::MbrOther(pt) => {
+            format!("MBR partition type 0x{pt:02x} (run sd-format --yes)")
+        }
+        SdDiskKind::Gpt => "GPT protective MBR (unsupported — run sd-format --yes)".to_string(),
+        SdDiskKind::SuperfloppyFat32 => {
+            "Superfloppy FAT32 (no MBR partition table — run sd-format --yes)".to_string()
+        }
+        SdDiskKind::SuperfloppyExFat => {
+            "Superfloppy exFAT (unsupported — run sd-format --yes)".to_string()
+        }
+    }
+}
+
+fn format_ascii_field(bytes: &[u8], len: usize) -> String {
+    let clamped = len.min(bytes.len());
+    String::from_utf8_lossy(&bytes[..clamped])
+        .trim()
+        .to_string()
+}
+
+fn print_sd_status(st: &SdStatusReport) {
+    let prod = format_ascii_field(&st.card_prod_name, st.card_prod_name.len());
+    let active = if st.active_file_len > 0 {
+        format_ascii_field(&st.active_file, st.active_file_len as usize)
+    } else {
+        "<none>".to_string()
+    };
+    let cap_gib = st.capacity_mb as f64 / 1024.0;
+    println!(
+        "MicroSD Card   : {}",
+        if st.card_initialized {
+            "INITIALIZED"
+        } else {
+            "NOT READY"
+        }
+    );
+    println!(
+        "  Product Name : {}",
+        if prod.is_empty() { "<n/a>" } else { &prod }
+    );
+    println!(
+        "  Capacity     : {} MB ({:.2} GiB)",
+        st.capacity_mb, cap_gib
+    );
+    println!("  Disk Layout  : {}", format_disk_kind(st.disk_kind));
+    println!(
+        "  FAT32 / Log  : mounted={} | logging_active={} | formatting={}",
+        st.fat32_mounted, st.logging_active, st.format_in_progress
+    );
+    println!("  Active File  : {active} ({} B written)", st.bytes_written);
+    println!(
+        "  500 Hz Stats : logged={} rec | drops={} | io_err={} | marks={} | last_err={}",
+        st.records_logged, st.dropped_records, st.write_errors, st.mark_count, st.last_error_code
+    );
+    println!(
+        "  GPIO State   : PD4(detect)={} | PC13(KEY)={} (active_{})",
+        if st.pd4_pin_high { "HIGH" } else { "LOW" },
+        if st.pc13_pin_high { "HIGH" } else { "LOW" },
+        if st.pc13_active_high { "high" } else { "low" }
+    );
+    println!(
+        "  LSE RTC Time : {:04}-{:02}-{:02} {:02}:{:02}:{:02}",
+        st.rtc_year, st.rtc_month, st.rtc_day, st.rtc_hour, st.rtc_minute, st.rtc_second
+    );
+}
+
+fn query_sd_status(port: &mut File) -> Result<SdStatusReport> {
+    match native_rpc(port, &Request::GetSdStatus)? {
+        Response::SdStatus(st) => Ok(st),
+        Response::Error(err) => bail!("GetSdStatus failed: {err:?} ({})", format_proto_error(err)),
+        other => bail!("unexpected GetSdStatus response: {other:?}"),
+    }
+}
+
+fn run_sd_status(port_path: &str) -> Result<()> {
+    let mut port = open_serial(port_path)?;
+    let st = query_sd_status(&mut port)?;
+    println!("STM32H743 SDMMC1 Status ({port_path})");
+    println!("=======================================");
+    print_sd_status(&st);
+    Ok(())
+}
+
+fn run_sd_format(port_path: &str, yes: bool) -> Result<()> {
+    if !yes {
+        bail!(
+            "Refusing to wipe MicroSD without `--yes`. Inspect first with `ecu-cli sd-status`, \
+             then run `ecu-cli sd-format --port {port_path} --yes`."
+        );
+    }
+    let mut port = open_serial(port_path)?;
+    println!("Formatting MicroSD on {port_path} as MBR + FAT32 (waiting up to 30 s)...");
+    match native_rpc_with_timeout(
+        &mut port,
+        &Request::FormatSdFat32 {
+            confirm_magic: SD_FORMAT_CONFIRM_MAGIC,
+        },
+        Duration::from_secs(30),
+    )? {
+        Response::Ack => println!("Format & FAT32 read-back verification succeeded."),
+        Response::Error(err) => bail!("sd-format failed: {err:?} ({})", format_proto_error(err)),
+        other => bail!("unexpected sd-format response: {other:?}"),
+    }
+
+    let st = query_sd_status(&mut port)?;
+    print_sd_status(&st);
+    if st.rtc_year <= 2026 && st.rtc_month == 1 && st.rtc_day == 1 {
+        println!(
+            "Tip: RTC is still at default fallback date; run `ecu-cli rtc-sync --port \
+             {port_path}` to timestamp new logs accurately."
+        );
+    }
+    Ok(())
+}
+
+fn run_sd_ls(port_path: &str) -> Result<()> {
+    let mut port = open_serial(port_path)?;
+    println!("Root Directory Listing ({port_path})");
+    println!("====================================");
+    let mut offset: u16 = 0;
+    let mut total_listed = 0usize;
+    for _ in 0..1024 {
+        let (total_files, entries) = match native_rpc(&mut port, &Request::ListSdFiles { offset })?
+        {
+            Response::SdFileList {
+                total_files,
+                entries,
+            } => (total_files, entries),
+            Response::Error(err) => bail!("sd-ls failed: {err:?} ({})", format_proto_error(err)),
+            other => bail!("unexpected ListSdFiles response: {other:?}"),
+        };
+
+        if total_listed == 0 {
+            println!("Total root files: {total_files}");
+        }
+        if entries.is_empty() {
+            break;
+        }
+        for entry in &entries {
+            let name = format_ascii_field(&entry.name, entry.name_len as usize);
+            total_listed += 1;
+            println!(
+                "  {total_listed:>3}. {name:<12}  {:>10} B",
+                entry.size_bytes
+            );
+        }
+        offset = offset.saturating_add(entries.len() as u16);
+        if total_listed >= total_files as usize {
+            break;
+        }
+    }
+    Ok(())
+}
+
+fn run_sd_pull(file: &str, out: &Path, port_path: &str) -> Result<()> {
+    let trimmed = file.trim();
+    if trimmed.is_empty() || trimmed.len() > 12 {
+        bail!("filename `{trimmed}` must be 1..=12 ASCII characters (8.3 FAT name)");
+    }
+    let mut name = [0u8; 12];
+    name[..trimmed.len()].copy_from_slice(trimmed.as_bytes());
+    let name_len = trimmed.len() as u8;
+
+    let mut port = open_serial(port_path)?;
+    let started = Instant::now();
+    let mut offset = 0u32;
+    let mut total_size: Option<u32> = None;
+    let mut out_buf = Vec::new();
+
+    loop {
+        let req_len = match total_size {
+            Some(total) => total.saturating_sub(offset).min(MAX_CHUNK_BYTES as u32) as u16,
+            None => MAX_CHUNK_BYTES as u16,
+        };
+        if req_len == 0 && total_size.is_some() {
+            break;
+        }
+        let req = Request::ReadSdFileChunk {
+            name,
+            name_len,
+            offset,
+            len: req_len,
+        };
+        match native_rpc_with_timeout(&mut port, &req, Duration::from_secs(5))? {
+            Response::SdFileChunk {
+                offset: chunk_off,
+                total_size: file_total,
+                data,
+            } => {
+                if chunk_off != offset {
+                    bail!("chunk offset mismatch: expected {offset}, got {chunk_off}");
+                }
+                if total_size.is_none() {
+                    total_size = Some(file_total);
+                    out_buf.reserve(file_total as usize);
+                    if file_total == 0 {
+                        break;
+                    }
+                }
+                if data.is_empty() {
+                    bail!("unexpected empty chunk at offset {offset} of {file_total}");
+                }
+                out_buf.extend_from_slice(&data);
+                offset = offset.saturating_add(data.len() as u32);
+                if offset >= file_total {
+                    break;
+                }
+            }
+            Response::Error(err) => {
+                bail!(
+                    "sd-pull failed at offset {offset}: {err:?} ({})",
+                    format_proto_error(err)
+                )
+            }
+            other => bail!("unexpected ReadSdFileChunk response: {other:?}"),
+        }
+    }
+
+    fs::write(out, &out_buf).with_context(|| format!("failed to write {}", out.display()))?;
+    let elapsed = started.elapsed().as_secs_f64().max(0.001);
+    let kib_s = (out_buf.len() as f64 / 1024.0) / elapsed;
+    println!(
+        "Pulled {trimmed} -> {} ({} bytes in {:.2}s, {:.1} KiB/s)",
+        out.display(),
+        out_buf.len(),
+        elapsed,
+        kib_s
+    );
+    Ok(())
+}
+
+struct CsvConvertSummary {
+    header: DatalogFileHeader,
+    csv: String,
+    records_decoded: usize,
+    bad_crc_records: usize,
+    zero_pad_slots: usize,
+    marks_seen: usize,
+}
+
+fn convert_bdl_bytes_to_csv(bytes: &[u8]) -> Result<CsvConvertSummary> {
+    if bytes.len() < LOG_RECORD_BYTES {
+        bail!(
+            ".BDL file too short ({} bytes, need at least {LOG_RECORD_BYTES} byte header)",
+            bytes.len()
+        );
+    }
+    let hdr_bytes: &[u8; LOG_RECORD_BYTES] = bytes[..LOG_RECORD_BYTES]
+        .try_into()
+        .expect("exact header slice");
+    let header = DatalogFileHeader::from_bytes(hdr_bytes)
+        .context("invalid BDL1 header magic, version, record size, or CRC32")?;
+
+    let body = &bytes[LOG_RECORD_BYTES..];
+    let mut csv = String::with_capacity((body.len() / LOG_RECORD_BYTES) * 112 + 256);
+    csv.push_str(
+        "time_s,rpm,map_kpa,tps_pct,lambda,target_lambda,spark_deg,inj_pw_ms,ve_pct,ect_c,\
+         iat_c,vbatt_v,vss_kmh,vtec_state,stft_pct,faults_hex,mark_seq,mark_edge,sync_state,\
+         wideband_state,lsu_ri_ohms,switch_bits,aux_bits\n",
+    );
+
+    let mut base_uptime_ms: Option<u32> = None;
+    let mut records_decoded = 0usize;
+    let mut bad_crc_records = 0usize;
+    let mut zero_pad_slots = 0usize;
+    let mut marks_seen = 0usize;
+
+    let (slots, _) = body.as_chunks::<LOG_RECORD_BYTES>();
+    for slot in slots {
+        if slot.iter().all(|&b| b == 0) {
+            zero_pad_slots += 1;
+            continue;
+        }
+        let Some(rec) = DatalogRecord::from_bytes(slot) else {
+            bad_crc_records += 1;
+            continue;
+        };
+        let t0 = *base_uptime_ms.get_or_insert(rec.uptime_ms);
+        let time_s = rec.uptime_ms.saturating_sub(t0) as f64 / 1000.0;
+        let mark_edge = u8::from((rec.flags & LOG_FLAG_MARK_EDGE) != 0);
+        if mark_edge != 0 {
+            marks_seen += 1;
+        }
+        let _ = writeln!(
+            csv,
+            "{:.3},{},{:.2},{:.2},{:.4},{:.4},{:.1},{:.3},{:.2},{:.1},{:.1},{:.2},{:.1},{},{:.2},0x{:08x},{},{},{},{},{:.1},0x{:02x},0x{:02x}",
+            time_s,
+            rec.rpm,
+            rec.map_kpa_x10 as f32 / 10.0,
+            rec.tps_pct_x10 as f32 / 10.0,
+            rec.lambda_x1000 as f32 / 1000.0,
+            rec.target_lambda_x1000 as f32 / 1000.0,
+            rec.spark_adv_deg_x10 as f32 / 10.0,
+            rec.inj_pw1_us as f32 / 1000.0,
+            rec.ve_pct_x10 as f32 / 10.0,
+            rec.ect_c_x10 as f32 / 10.0,
+            rec.iat_c_x10 as f32 / 10.0,
+            rec.vbatt_mv as f32 / 1000.0,
+            rec.vss_kmh_x10 as f32 / 10.0,
+            rec.vtec_state,
+            rec.stft_pct_x10 as f32 / 10.0,
+            rec.faults,
+            rec.mark_seq,
+            mark_edge,
+            rec.sync_state,
+            rec.wideband_state,
+            rec.lsu_ri_ohms_x10 as f32 / 10.0,
+            rec.switch_bits,
+            rec.aux_outputs_bits
+        );
+        records_decoded += 1;
+    }
+
+    Ok(CsvConvertSummary {
+        header,
+        csv,
+        records_decoded,
+        bad_crc_records,
+        zero_pad_slots,
+        marks_seen,
+    })
+}
+
+fn run_log_to_csv(input: &Path, out: &Path) -> Result<()> {
+    let raw = fs::read(input).with_context(|| format!("failed to read {}", input.display()))?;
+    let trailing_bytes = raw.len() % LOG_RECORD_BYTES;
+    let summary = convert_bdl_bytes_to_csv(&raw)?;
+    fs::write(out, &summary.csv).with_context(|| format!("failed to write {}", out.display()))?;
+    let c = summary.header.created;
+    println!(
+        "BDL1 Header : v{} | {} Hz | created {:04}-{:02}-{:02} {:02}:{:02}:{:02} | cal_crc=0x{:08x}",
+        summary.header.version,
+        summary.header.sample_rate_hz,
+        c.year,
+        c.month,
+        c.day,
+        c.hour,
+        c.minute,
+        c.second,
+        summary.header.cal_crc32
+    );
+    println!(
+        "Decoded CSV : {} rows -> {} (marks={}, bad_crc={}, zero_pad={}, trailing_bytes={})",
+        summary.records_decoded,
+        out.display(),
+        summary.marks_seen,
+        summary.bad_crc_records,
+        summary.zero_pad_slots,
+        trailing_bytes
+    );
+    Ok(())
+}
+
+fn parse_tz_offset_hhmm(spec: &str) -> Option<i32> {
+    let s = spec.trim();
+    let sign = match s.as_bytes().first().copied()? {
+        b'+' => 1i32,
+        b'-' => -1i32,
+        _ => return None,
+    };
+    let digits = &s[1..];
+    if digits.len() != 4 || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let hours: i32 = digits[0..2].parse().ok()?;
+    let mins: i32 = digits[2..4].parse().ok()?;
+    Some(sign * (hours * 3600 + mins * 60))
+}
+
+fn detect_local_tz_offset_secs() -> i32 {
+    if let Ok(out) = Command::new("date").arg("+%z").output()
+        && out.status.success()
+        && let Ok(text) = core::str::from_utf8(&out.stdout)
+        && let Some(secs) = parse_tz_offset_hhmm(text)
+    {
+        return secs;
+    }
+    0
+}
+
+fn compute_rtc_fields(unix_secs: i64, tz_offset_secs: i32) -> (u16, u8, u8, u8, u8, u8, u8) {
+    let local_secs = unix_secs.saturating_add(tz_offset_secs as i64).max(0) as u64;
+    let ts = RtcTimestamp::from_unix_secs(local_secs);
+    // 1970-01-01 was Thursday (`4` where `0` = Sun .. `6` = Sat).
+    let days = (local_secs / 86_400) as i64;
+    let weekday = (days + 4).rem_euclid(7) as u8;
+    (
+        ts.year, ts.month, ts.day, weekday, ts.hour, ts.minute, ts.second,
+    )
+}
+
+fn run_rtc_sync(port_path: &str, tz_offset_hours: Option<i8>) -> Result<()> {
+    let tz_secs = match tz_offset_hours {
+        Some(h) => i32::from(h) * 3600,
+        None => detect_local_tz_offset_secs(),
+    };
+    let unix_secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .context("system clock is before UNIX_EPOCH")?
+        .as_secs() as i64;
+    let (year, month, day, weekday, hour, minute, second) = compute_rtc_fields(unix_secs, tz_secs);
+
+    let mut port = open_serial(port_path)?;
+    match native_rpc(
+        &mut port,
+        &Request::SetRtcDateTime {
+            year,
+            month,
+            day,
+            weekday,
+            hour,
+            minute,
+            second,
+        },
+    )? {
+        Response::Ack => {
+            println!(
+                "Synchronized STM32H743 LSE RTC -> {year:04}-{month:02}-{day:02} \
+                 {hour:02}:{minute:02}:{second:02} (tz {:+.1}h)",
+                tz_secs as f32 / 3600.0
+            );
+        }
+        Response::Error(err) => bail!("rtc-sync failed: {err:?} ({})", format_proto_error(err)),
+        other => bail!("unexpected SetRtcDateTime response: {other:?}"),
+    }
+    Ok(())
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
@@ -615,16 +1121,29 @@ fn main() -> Result<()> {
         Commands::FrameDemo => frame_demo(),
         Commands::Probe { port } => run_probe(&port),
         Commands::TsCheck { port, burn_test } => run_ts_check(&port, burn_test),
+        Commands::SdStatus { port } => run_sd_status(&port),
+        Commands::SdFormat { port, yes } => run_sd_format(&port, yes),
+        Commands::SdLs { port } => run_sd_ls(&port),
+        Commands::SdPull { file, out, port } => run_sd_pull(&file, &out, &port),
+        Commands::LogToCsv { input, out } => run_log_to_csv(&input, &out),
+        Commands::RtcSync {
+            port,
+            tz_offset_hours,
+        } => run_rtc_sync(&port, tz_offset_hours),
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use ecu_core::EngineCoordinator;
+    use ecu_core::aux_io::AuxIoTelemetry;
+    use ecu_core::datalog::{DatalogFileHeader, DatalogRecord, LOG_RECORD_BYTES, RtcTimestamp};
     use ecu_types::{CalibrationBlob, FaultFlags};
 
     use super::{
-        build_ts_page_cmd, format_fault_flags, frame_demo, inspect_cal, kpa_to_honda_map_adc,
-        run_bench_sim, tps_pct_to_adc,
+        build_ts_page_cmd, compute_rtc_fields, convert_bdl_bytes_to_csv, format_fault_flags,
+        frame_demo, inspect_cal, kpa_to_honda_map_adc, parse_tz_offset_hhmm, run_bench_sim,
+        tps_pct_to_adc,
     };
 
     #[test]
@@ -648,5 +1167,86 @@ mod tests {
 
         let cmd = build_ts_page_cmd(b'R', 12, 2);
         assert_eq!(cmd, [b'R', 0, 0, 12, 0, 2, 0]);
+    }
+
+    #[test]
+    fn bdl_to_csv_decodes_records_marks_and_rejects_bad_crc() {
+        let created = RtcTimestamp {
+            year: 2026,
+            month: 11,
+            day: 14,
+            hour: 23,
+            minute: 15,
+            second: 4,
+            subsec_ms: 0,
+        };
+        let hdr = DatalogFileHeader::new(created, 0x1234_5678);
+        let mut raw = Vec::new();
+        raw.extend_from_slice(&hdr.to_bytes());
+
+        let mut snap = EngineCoordinator::new().snapshot();
+        snap.uptime_ms = 5_000;
+        snap.rpm = 3_200;
+        snap.sensors.map_kpa = 98.4;
+        snap.sensors.tps_pct = 55.2;
+        snap.lambda = 0.875;
+        snap.target_lambda = 0.860;
+        snap.actuators.spark_advance_deg_x10 = 245;
+        snap.actuators.inj_pw_us[0] = 6_420;
+        snap.ve_pct = 88.5;
+        snap.sensors.ect_c = 86.2;
+        snap.sensors.iat_c = 34.0;
+        snap.sensors.vbatt_v = 13.85;
+        snap.sensors.vss_kmh = 72.0;
+
+        let aux = AuxIoTelemetry::default();
+        let rec0 = DatalogRecord::from_telemetry(&snap, &aux, 1, true, true);
+        raw.extend_from_slice(&rec0.to_bytes());
+
+        snap.uptime_ms = 5_002;
+        snap.rpm = 3_250;
+        let rec1 = DatalogRecord::from_telemetry(&snap, &aux, 1, false, false);
+        raw.extend_from_slice(&rec1.to_bytes());
+
+        // Add one corrupted record and one trailing zero pad slot.
+        let mut corrupt = rec1.to_bytes();
+        corrupt[0] ^= 0xff;
+        raw.extend_from_slice(&corrupt);
+        raw.extend_from_slice(&[0u8; LOG_RECORD_BYTES]);
+
+        let summary = convert_bdl_bytes_to_csv(&raw).expect("valid BDL file should convert");
+        assert_eq!(summary.header.cal_crc32, 0x1234_5678);
+        assert_eq!(summary.records_decoded, 2);
+        assert_eq!(summary.marks_seen, 1);
+        assert_eq!(summary.bad_crc_records, 1);
+        assert_eq!(summary.zero_pad_slots, 1);
+
+        let mut lines = summary.csv.lines();
+        let header_line = lines.next().expect("CSV header line");
+        assert!(header_line.starts_with(
+            "time_s,rpm,map_kpa,tps_pct,lambda,target_lambda,spark_deg,inj_pw_ms,ve_pct,ect_c,\
+             iat_c,vbatt_v,vss_kmh,vtec_state,stft_pct,faults_hex,"
+        ));
+        let row0 = lines.next().expect("row 0");
+        assert!(row0.starts_with(
+            "0.000,3200,98.40,55.20,0.8750,0.8600,24.5,6.420,88.50,86.2,34.0,13.85,72.0,"
+        ));
+        let row1 = lines.next().expect("row 1");
+        assert!(row1.starts_with("0.002,3250,"));
+        assert!(lines.next().is_none());
+    }
+
+    #[test]
+    fn rtc_fields_and_tz_offset_parser_match_calendar() {
+        assert_eq!(parse_tz_offset_hhmm("+0800\n"), Some(28_800));
+        assert_eq!(parse_tz_offset_hhmm("-0530"), Some(-19_800));
+        assert_eq!(parse_tz_offset_hhmm("invalid"), None);
+
+        // 2026-11-14 00:00:00 UTC (Saturday = 6) -> +8h = 2026-11-14 08:00:00 (Saturday = 6)
+        let utc_2026_11_14 = 1_794_614_400i64;
+        assert_eq!(
+            compute_rtc_fields(utc_2026_11_14, 28_800),
+            (2026, 11, 14, 6, 8, 0, 0)
+        );
     }
 }

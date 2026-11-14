@@ -15,6 +15,7 @@ mod can_hw;
 mod dlc_hw;
 mod nvm;
 mod outputs;
+mod sd_logger_hw;
 mod sensors_adc;
 mod usb_comm;
 mod wideband_hw;
@@ -26,17 +27,17 @@ use ecu_core::sensors::InvertedMcuSwitchPins;
 use ecu_types::{CalibrationBlob, SyncState, WidebandState};
 use embassy_executor::Spawner;
 use embassy_stm32::gpio::{Input, Level, Output, Pull, Speed};
-use embassy_stm32::rcc::mux::{Adcsel, Fdcansel, Usbsel};
+use embassy_stm32::rcc::mux::{Adcsel, Fdcansel, Sdmmcsel, Usbsel};
 use embassy_stm32::rcc::{
-    AHBPrescaler, APBPrescaler, Hse, HseMode, Pll, PllDiv, PllMul, PllPreDiv, PllSource, Sysclk,
-    VoltageScale,
+    AHBPrescaler, APBPrescaler, Hse, HseMode, LsConfig, Pll, PllDiv, PllMul, PllPreDiv, PllSource,
+    Sysclk, VoltageScale,
 };
 use embassy_stm32::time::Hertz;
 use embassy_stm32::timer::Channel;
 use embassy_stm32::timer::input_capture::{CapturePin, InputCapture};
 use embassy_stm32::timer::low_level::{CountingMode, InputCaptureMode, InputTISelection};
 use embassy_stm32::{
-    Config, bind_interrupts, can, dma, exti, interrupt, pac, peripherals, timer, usart, usb,
+    Config, bind_interrupts, can, dma, exti, interrupt, pac, peripherals, sdmmc, timer, usart, usb,
 };
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::mutex::Mutex;
@@ -59,6 +60,7 @@ bind_interrupts!(struct Irqs {
     USART1 => usart::BufferedInterruptHandler<peripherals::USART1>;
     EXTI9_5 => exti::InterruptHandler<interrupt::typelevel::EXTI9_5>;
     EXTI15_10 => exti::InterruptHandler<interrupt::typelevel::EXTI15_10>;
+    SDMMC1 => sdmmc::InterruptHandler<peripherals::SDMMC1>;
 });
 
 pub(crate) struct SharedEcuState {
@@ -128,9 +130,11 @@ fn configure_h743_clocks() -> Config {
     config.rcc.apb2_pre = APBPrescaler::DIV2;
     config.rcc.apb3_pre = APBPrescaler::DIV2;
     config.rcc.apb4_pre = APBPrescaler::DIV2;
+    config.rcc.ls = LsConfig::default_lse();
     config.rcc.mux.usbsel = Usbsel::PLL3_Q;
     config.rcc.mux.adcsel = Adcsel::PLL3_R;
     config.rcc.mux.fdcansel = Fdcansel::PLL1_Q;
+    config.rcc.mux.sdmmcsel = Sdmmcsel::PLL1_Q;
     config
 }
 
@@ -285,6 +289,8 @@ async fn main(spawner: Spawner) {
     let mut boot_page_buf = [0u8; TS_PAGE_SIZE];
     let cal = nvm.load_calibration(&mut boot_page_buf).await;
     defmt::assert!(cal.validate_header());
+    proto_tunerstudio::pack_page(&cal, &mut boot_page_buf);
+    sd_logger_hw::update_cal_crc(ecu_types::crc32(&boot_page_buf));
     ECU_STATE.lock().await.cal = Some(cal);
 
     let jid = nvm.jedec_id();
@@ -293,6 +299,21 @@ async fn main(spawner: Spawner) {
     let dlc_uart = dlc_hw::init_dlc_uart(p.USART1, p.PA10, p.PA9);
     let altf_exti = aux_io_hw::init_altf_input(p.PB7, p.EXTI7, Irqs);
     let flex_exti = aux_io_hw::init_flex_input(p.PE15, p.EXTI15, Irqs);
+    let (sdmmc, pd4_detect, mut log_mark_btn) = sd_logger_hw::init_hardware(
+        sd_logger_hw::SdLoggerPeripherals {
+            sdmmc1: p.SDMMC1,
+            pc12_ck: p.PC12,
+            pd2_cmd: p.PD2,
+            pc8_d0: p.PC8,
+            pc9_d1: p.PC9,
+            pc10_d2: p.PC10,
+            pc11_d3: p.PC11,
+            pd4_detect: p.PD4,
+            pc13_key: p.PC13,
+            rtc: p.RTC,
+        },
+        Irqs,
+    );
     {
         let state = ECU_STATE.lock().await;
         aux_io_hw::set_capture_polarity(
@@ -322,6 +343,7 @@ async fn main(spawner: Spawner) {
     if let Some(uart) = dlc_uart {
         spawner.spawn(dlc_hw::dlc_uart_task(uart).expect("valid dlc_uart_task token"));
     }
+    spawner.spawn(sd_logger_hw::sd_logger_task(sdmmc, pd4_detect).expect("valid sd_logger token"));
 
     // 6. All outputs verified safe -> Assert `PB15` (`ACTUATOR_OE_N`) LOW to arm low-side buffers!
     actuator_oe_n.set_low();
@@ -332,6 +354,7 @@ async fn main(spawner: Spawner) {
     loop {
         ticker.next().await;
         tick_count = tick_count.wrapping_add(1);
+        log_mark_btn.poll_1khz();
 
         let mut raw_adc = adc_sensors.read_raw(Irqs).await;
         wideband_hw.read_adc_into(&mut raw_adc);
@@ -398,6 +421,10 @@ async fn main(spawner: Spawner) {
         var_a19_out.set_level(Level::from(aux_snap.outputs.pe1_on));
         wideband_hw.apply_outputs(out.lsu_ip_dac_code, out.lsu_heater_duty_per_mille);
 
+        if tick_count.is_multiple_of(2) {
+            sd_logger_hw::push_500hz_sample(&snap, &aux_snap);
+        }
+
         // 2 Hz onboard `PE3` heartbeat LED (`5 Hz` fast blink if any diagnostic fault is set)
         let blink_period_ms = if faults_empty { 250 } else { 100 };
         if tick_count.is_multiple_of(blink_period_ms) {
@@ -408,6 +435,7 @@ async fn main(spawner: Spawner) {
             let (spk_cnt, inj_cnt, tach_cnt, cop_wd) = HardwareOutputs::telemetry_counts();
             let can_st = can_hw::stats();
             let dlc_cnt = dlc_hw::answered_frame_count();
+            let sd_st = sd_logger_hw::status_report();
             let eth_pct = if aux_snap.flex.is_valid() {
                 aux_snap.flex.ethanol_pct as i16
             } else {
@@ -422,7 +450,7 @@ async fn main(spawner: Spawner) {
                 "ECU 1Hz | up={}s | sync={} | rpm={} | adv={}deg | inj1={}us | spk={} | \
                  inj={} | tach={} | wd={} | flr={} | wb={} | ri={}ohm | lam={} | htr={} | \
                  eth={} | altf={} | aux=0x{=u8:02x} | can={}/{}/{}/{}/tec={} | dlc={} | \
-                 flt=0x{=u32:08x}",
+                 sd=on:{}/r:{}/d:{}/e:{}/mk:{} | flt=0x{=u32:08x}",
                 tick_count / 1_000,
                 snap.sync_state,
                 snap.rpm,
@@ -446,6 +474,11 @@ async fn main(spawner: Spawner) {
                 can_st.rx_count,
                 can_st.tec,
                 dlc_cnt,
+                sd_st.logging_active,
+                sd_st.records_logged,
+                sd_st.dropped_records,
+                sd_st.write_errors,
+                sd_st.mark_count,
                 snap.faults.0
             );
         }

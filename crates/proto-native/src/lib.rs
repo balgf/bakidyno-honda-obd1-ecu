@@ -10,6 +10,63 @@ use serde::{Deserialize, Serialize};
 pub const PROTO_VERSION: u16 = 1;
 pub const MAX_CHUNK_BYTES: usize = 256;
 pub const MAX_FRAME_BYTES: usize = 512;
+/// Magic sentinel (`"FORM"`) required in [`Request::FormatSdFat32`] to prevent accidental wipes.
+pub const SD_FORMAT_CONFIRM_MAGIC: u32 = 0x464f_524d;
+
+/// Filesystem/partition table layout observed read-only on the MicroSD slot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+pub enum SdDiskKind {
+    Unknown,
+    Blank,
+    MbrFat32,
+    MbrExFat,
+    MbrNtfs,
+    MbrLinux,
+    MbrOther(u8),
+    Gpt,
+    SuperfloppyFat32,
+    SuperfloppyExFat,
+}
+
+/// Compact root directory file summary returned by [`Response::SdFileList`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+pub struct SdDirEntry {
+    pub name: [u8; 12],
+    pub name_len: u8,
+    pub size_bytes: u32,
+}
+
+/// Live `SDMMC1` + FAT32 + `RTC` + `PC13` mark status snapshot returned by [`Request::GetSdStatus`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+pub struct SdStatusReport {
+    pub pd4_pin_high: bool,
+    pub pc13_pin_high: bool,
+    pub pc13_active_high: bool,
+    pub card_initialized: bool,
+    pub disk_kind: SdDiskKind,
+    pub fat32_mounted: bool,
+    pub logging_active: bool,
+    pub format_in_progress: bool,
+    pub last_error_code: u8,
+    pub card_prod_name: [u8; 5],
+    pub capacity_mb: u32,
+    pub active_file: [u8; 12],
+    pub active_file_len: u8,
+    pub bytes_written: u32,
+    pub records_logged: u32,
+    pub dropped_records: u32,
+    pub write_errors: u32,
+    pub mark_count: u32,
+    pub rtc_year: u16,
+    pub rtc_month: u8,
+    pub rtc_day: u8,
+    pub rtc_hour: u8,
+    pub rtc_minute: u8,
+    pub rtc_second: u8,
+}
 
 /// Host-to-ECU RPC request (`no_std` stack-allocated; `Box` intentionally avoided).
 #[allow(clippy::large_enum_variant)]
@@ -33,6 +90,35 @@ pub enum Request {
     SetTimingOverride {
         advance_deg_x10: Option<i16>,
     },
+    /// Reads live MicroSD card, FAT32 logger, `PD4`/`PC13` pin, and `RTC` state.
+    GetSdStatus,
+    /// Lists up to 8 FAT32 root directory files starting from entry `offset`.
+    ListSdFiles {
+        offset: u16,
+    },
+    /// Formats the inserted MicroSD card as MBR + FAT32 (`confirm_magic == SD_FORMAT_CONFIRM_MAGIC`).
+    FormatSdFat32 {
+        confirm_magic: u32,
+    },
+    /// Downloads up to [`MAX_CHUNK_BYTES`] from a root-directory FAT32 file (e.g., `LOG00001.BDL`).
+    ReadSdFileChunk {
+        name: [u8; 12],
+        name_len: u8,
+        offset: u32,
+        len: u16,
+    },
+    /// Updates the STM32H743 `LSE` `RTC` calendar & wall-clock time (`weekday`: `0` = Sun .. `6` = Sat).
+    SetRtcDateTime {
+        year: u16,
+        month: u8,
+        day: u8,
+        weekday: u8,
+        hour: u8,
+        minute: u8,
+        second: u8,
+    },
+    /// Triggers a manual datalog mark event over USB RPC (equivalent to `PC13` `KEY` button press).
+    TriggerLogMark,
 }
 
 /// ECU-to-Host RPC response (`no_std` stack-allocated; `Box` intentionally avoided).
@@ -52,6 +138,16 @@ pub enum Response {
     },
     Ack,
     Error(ProtoError),
+    SdStatus(SdStatusReport),
+    SdFileList {
+        total_files: u16,
+        entries: Vec<SdDirEntry, 8>,
+    },
+    SdFileChunk {
+        offset: u32,
+        total_size: u32,
+        data: Vec<u8, MAX_CHUNK_BYTES>,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -64,6 +160,11 @@ pub enum ProtoError {
     DeserializeFailed,
     OutOfBounds,
     NvmWriteFailed,
+    SdNotReady,
+    SdBusy,
+    SdFormatRejectedEngineRunning,
+    SdFileNotFound,
+    SdIoFailed,
 }
 
 /// Pure `no_std` Consistent Overhead Byte Stuffing (`COBS`) encoder appending a `0x00` delimiter.
@@ -182,8 +283,9 @@ mod tests {
     use heapless::Vec;
 
     use super::{
-        MAX_CHUNK_BYTES, MAX_FRAME_BYTES, ProtoError, Request, Response, cobs_decode,
-        cobs_encode_with_delimiter, decode_frame, encode_frame,
+        MAX_CHUNK_BYTES, MAX_FRAME_BYTES, ProtoError, Request, Response, SD_FORMAT_CONFIRM_MAGIC,
+        SdDirEntry, SdDiskKind, SdStatusReport, cobs_decode, cobs_encode_with_delimiter,
+        decode_frame, encode_frame,
     };
 
     #[test]
@@ -262,5 +364,74 @@ mod tests {
             decode_frame::<Request>(&[0x02, 0x01, 0x00]),
             Err(ProtoError::CrcMismatch)
         );
+    }
+
+    #[test]
+    fn sd_and_rtc_frames_fit_within_frame_budget() {
+        let mut wire = [0u8; MAX_FRAME_BYTES];
+        let fmt_req = Request::FormatSdFat32 {
+            confirm_magic: SD_FORMAT_CONFIRM_MAGIC,
+        };
+        let flen = encode_frame(&fmt_req, &mut wire).expect("encode format req");
+        assert_eq!(decode_frame::<Request>(&wire[..flen]), Ok(fmt_req));
+
+        let status = SdStatusReport {
+            pd4_pin_high: false,
+            pc13_pin_high: false,
+            pc13_active_high: true,
+            card_initialized: true,
+            disk_kind: SdDiskKind::MbrFat32,
+            fat32_mounted: true,
+            logging_active: true,
+            format_in_progress: false,
+            last_error_code: 0,
+            card_prod_name: *b"SD64G",
+            capacity_mb: 59_000,
+            active_file: *b"LOG00001.BDL",
+            active_file_len: 12,
+            bytes_written: 65_536,
+            records_logged: 1_024,
+            dropped_records: 0,
+            write_errors: 0,
+            mark_count: 3,
+            rtc_year: 2026,
+            rtc_month: 11,
+            rtc_day: 14,
+            rtc_hour: 23,
+            rtc_minute: 5,
+            rtc_second: 12,
+        };
+        let s_resp = Response::SdStatus(status);
+        let slen = encode_frame(&s_resp, &mut wire).expect("encode SdStatus");
+        assert_eq!(decode_frame::<Response>(&wire[..slen]), Ok(s_resp));
+
+        let mut entries = Vec::<SdDirEntry, 8>::new();
+        for idx in 0..8 {
+            entries
+                .push(SdDirEntry {
+                    name: *b"LOG00001.BDL",
+                    name_len: 12,
+                    size_bytes: 1_000_000 + idx,
+                })
+                .expect("push dir entry");
+        }
+        let l_resp = Response::SdFileList {
+            total_files: 8,
+            entries,
+        };
+        let llen = encode_frame(&l_resp, &mut wire).expect("encode max SdFileList");
+        assert_eq!(decode_frame::<Response>(&wire[..llen]), Ok(l_resp));
+
+        let mut data = Vec::<u8, MAX_CHUNK_BYTES>::new();
+        for i in 0..MAX_CHUNK_BYTES {
+            data.push((i & 0xff) as u8).expect("push file byte");
+        }
+        let c_resp = Response::SdFileChunk {
+            offset: 1024,
+            total_size: 123_456,
+            data,
+        };
+        let clen = encode_frame(&c_resp, &mut wire).expect("encode max SdFileChunk");
+        assert_eq!(decode_frame::<Response>(&wire[..clen]), Ok(c_resp));
     }
 }
