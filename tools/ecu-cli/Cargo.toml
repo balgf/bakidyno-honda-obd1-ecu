@@ -1,0 +1,15 @@
+[package]
+name = "ecu-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Host bench simulation, calibration inspector & proto-native CLI for the Honda Civic OBD1 ECU"
+
+[dependencies]
+ecu-types = { workspace = true, features = ["std"] }
+ecu-core = { workspace = true }
+proto-native = { workspace = true }
+proto-tunerstudio = { workspace = true }
+postcard = { workspace = true }
+clap = { workspace = true }
+anyhow = { workspace = true }

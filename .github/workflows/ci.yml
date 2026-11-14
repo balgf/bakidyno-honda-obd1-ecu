@@ -1,0 +1,99 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  host:
+    name: Host Workspace (fmt, clippy, test, doc)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: "."
+
+      - name: Check formatting
+        run: cargo fmt --all --check
+
+      - name: Run clippy
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Run unit tests
+        run: cargo test --workspace
+
+      - name: Run ecu-cli bench simulation
+        run: |
+          cargo run -p ecu-cli -- sim
+          cargo run -p ecu-cli -- inspect-cal
+          cargo run -p ecu-cli -- frame-demo
+
+      - name: Build documentation
+        env:
+          RUSTDOCFLAGS: -D warnings
+        run: cargo doc --no-deps --workspace
+
+  firmware:
+    name: STM32H743 Firmware (thumbv7em-none-eabihf)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: firmware
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: thumbv7em-none-eabihf
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: firmware
+
+      - name: Check formatting
+        run: cargo fmt --check
+
+      - name: Run clippy
+        run: cargo clippy -- -D warnings
+
+      - name: Build release ELF
+        run: cargo build --release
+
+  rp2040-dizzy-sim:
+    name: RP2040 Distributor Simulator (thumbv6m-none-eabi)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: tools/rp2040-dizzy-sim
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: thumbv6m-none-eabi
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: tools/rp2040-dizzy-sim
+
+      - name: Check formatting
+        run: cargo fmt --check
+
+      - name: Run clippy
+        run: cargo clippy -- -D warnings
+
+      - name: Build release ELF
+        run: cargo build --release

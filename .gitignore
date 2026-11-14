@@ -1,0 +1,7 @@
+/target
+/**/target
+*.uf2
+*.bin
+*.hex
+.DS_Store
+_DOCS/

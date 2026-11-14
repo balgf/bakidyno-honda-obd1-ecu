@@ -1,0 +1,8 @@
+[target.thumbv7em-none-eabihf]
+runner = "probe-rs run --chip STM32H743VITx --speed 10000 --rtt-channel-mode no-block-trim"
+
+[build]
+target = "thumbv7em-none-eabihf"
+
+[env]
+DEFMT_LOG = "info"

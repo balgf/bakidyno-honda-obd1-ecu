@@ -1,0 +1,10 @@
+[package]
+name = "proto-tunerstudio"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Optional TunerStudio CRC32 serial adapter translating ecu-types without coupling firmware state"
+
+[dependencies]
+ecu-types = { workspace = true }
+crc32fast = { workspace = true }

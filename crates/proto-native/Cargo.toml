@@ -1,0 +1,18 @@
+[package]
+name = "proto-native"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Framed COBS + CRC32 + Postcard no_std tuning & telemetry protocol for ecu-cli and custom tuner-gui"
+
+[features]
+default = []
+defmt = ["dep:defmt", "ecu-types/defmt"]
+
+[dependencies]
+ecu-types = { workspace = true }
+serde = { workspace = true }
+postcard = { workspace = true }
+crc32fast = { workspace = true }
+heapless = { workspace = true, features = ["serde"] }
+defmt = { workspace = true, optional = true }

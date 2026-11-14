@@ -1,0 +1,14 @@
+[package]
+name = "ecu-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Pure no_std deterministic engine control, Honda OBD1 24/4/1 decoder, COP scheduler, VTEC & Bosch LSU 4.9 loops"
+
+[features]
+default = []
+defmt = ["dep:defmt", "ecu-types/defmt"]
+
+[dependencies]
+ecu-types = { workspace = true }
+defmt = { workspace = true, optional = true }

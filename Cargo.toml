@@ -1,0 +1,34 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/ecu-types",
+    "crates/ecu-core",
+    "crates/proto-native",
+    "crates/proto-tunerstudio",
+    "tools/ecu-cli",
+]
+# MCU binaries maintain isolated target/linker configs in `.cargo/config.toml`
+# while importing `ecu-types`, `ecu-core`, and `proto-*` via relative paths.
+exclude = [
+    "firmware",
+    "tools/rp2040-dizzy-sim",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+
+[workspace.dependencies]
+ecu-types = { path = "crates/ecu-types", default-features = false }
+ecu-core = { path = "crates/ecu-core", default-features = false }
+proto-native = { path = "crates/proto-native", default-features = false }
+proto-tunerstudio = { path = "crates/proto-tunerstudio", default-features = false }
+
+serde = { version = "1.0", default-features = false, features = ["derive"] }
+postcard = { version = "1.1", default-features = false }
+crc32fast = { version = "1.4", default-features = false }
+heapless = { version = "0.8", default-features = false }
+defmt = { version = "1.0" }
+clap = { version = "4.6", features = ["derive"] }
+anyhow = { version = "1.0" }
