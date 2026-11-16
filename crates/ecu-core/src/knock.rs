@@ -219,9 +219,8 @@ impl KnockDetector {
             self.hold_ms = [0; 4];
             self.decay_acc_ms = [0; 4];
         }
-        for cyl in 0..4 {
-            self.per_cyl_retard_deg_x10[cyl] =
-                self.per_cyl_retard_deg_x10[cyl].min(clean.max_retard_deg_x10);
+        for retard in &mut self.per_cyl_retard_deg_x10 {
+            *retard = (*retard).min(clean.max_retard_deg_x10);
         }
     }
 }
