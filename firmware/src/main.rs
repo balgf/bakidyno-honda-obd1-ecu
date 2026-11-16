@@ -42,7 +42,7 @@ use embassy_stm32::{
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::mutex::Mutex;
 use embassy_time::{Duration, Ticker};
-use nvm::NvmFlash;
+use nvm::NvmStorage;
 use outputs::HardwareOutputs;
 use proto_tunerstudio::TS_PAGE_SIZE;
 use sensors_adc::{Adc1SensorPins, Adc1Sensors};
@@ -176,9 +176,9 @@ async fn main(spawner: Spawner) {
     isolate_direct_adc3_pads();
 
     // 1. SAFETY FIRST: Hold `PB15` (`ACTUATOR_OE_N` on 3x `SN74AHCT541`) HIGH (`DISABLED`)
-    //    and initialize `SPI1` NOR Flash (`PD6` CS# held HIGH) before loading tune!
+    //    and initialize `SPI1` NVM (`PD6` CS# held HIGH) before loading tune!
     let mut actuator_oe_n = Output::new(p.PB15, Level::High, Speed::Low);
-    let mut nvm = NvmFlash::init(p.SPI1, p.PB3, p.PD7, p.PB4, p.PD6).await;
+    let mut nvm = NvmStorage::init(p.SPI1, p.PB3, p.PD7, p.PB4, p.PD6).await;
 
     // 2. Initialize digital outputs to safe OFF state BEFORE enabling `ACTUATOR_OE_N`
     let mut heartbeat_led = Output::new(p.PE3, Level::Low, Speed::Low);
@@ -265,7 +265,7 @@ async fn main(spawner: Spawner) {
         rt_trigger::update_targets(targets);
     }
 
-    let jid = nvm.jedec_id();
+    let nvm_info = nvm.status_report();
     let usb_init = usb_comm::init_cdc_acm(p.USB_OTG_FS, Irqs, p.PA12, p.PA11);
     let (can_tx, can_rx, can_props) = can_hw::init_and_selftest(p.FDCAN1, p.PD0, p.PD1).await;
     let dlc_uart = dlc_hw::init_dlc_uart(p.USART1, p.PA10, p.PA9);
@@ -296,11 +296,14 @@ async fn main(spawner: Spawner) {
 
     info!(
         "Civic OBD1 STM32H743VIT6 ECU booted @ 480 MHz | USB_OTG_FS CDC + SPI1 NVM | \
-         flash={} jedec={=u8:02x}{=u8:02x}{=u8:02x}",
-        nvm.is_detected(),
-        jid[0],
-        jid[1],
-        jid[2]
+         nvm={} detected={} size_kb={} addr={}B rdid={=u8:02x}{=u8:02x}{=u8:02x}",
+        nvm_info.medium,
+        nvm_info.detected,
+        nvm_info.capacity_bytes / 1024,
+        nvm_info.addr_bytes,
+        nvm_info.rdid[0],
+        nvm_info.rdid[1],
+        nvm_info.rdid[2]
     );
     tim2_hw.arm_irq();
     let _tim2_guard = tim2_hw;

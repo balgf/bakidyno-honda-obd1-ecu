@@ -40,11 +40,11 @@ Open-source standalone Engine Control Unit written in `no_std` Rust for 1992–1
 | **Steps 1–3: `STM32H743` & `RP2040` Trigger Sim** | `25 MHz` HSE → `480 MHz` `SYSCLK`, `PB15 ACTUATOR_OE_N` safe boot, `TIM2` `1 MHz` P1 ISR (`FullSynced720`), [`rp2040-dizzy-sim`](./tools/rp2040-dizzy-sim/src/main.rs) `24/4/1` + `VSS` generator | Verified on bench hardware |
 | **Step 4: `ADC1` DMA Sensors & Switch Inputs** | `ADC1` + `DMA1_CH0` `16-bit` (`8x` oversampling, `CYCLES810_5`) scanning `MAP`, `TPS`, `ECT`, `IAT`, `VBatt`, `VCC_5V_SNS`, `ELD` + all 7 `SN74HCS14` switch inputs | Verified on bench hardware |
 | **Step 5: Real-Time Timer Actuators** | `TIM1` `COP1–4` (`9.5 ms` dwell watchdog + `IgnitionToothScheduler`), `TIM3` sequential `INJ1–4` (`FuelToothScheduler`), `TIM16` `1.2 ms` `TACH_OUT`, `TIM4` `450 Hz` `IACV`/`O2HTC` | Verified on bench hardware |
-| **Step 6: USB CDC-ACM, `SPI1` NVM & Tuner** | Dual-protocol USB mux (`proto-native` + TunerStudio `msEnvelope_1.0`) + dual-region ping-pong `SPI1` NOR Flash (`CalibrationBlob` + `KnockConfig`/`AuxIoConfig`) + `ClearFaults` | Verified on bench hardware |
+| **Step 6: USB CDC-ACM, `SPI1` NVM & Tuner** | Dual-protocol USB mux (`proto-native` + TunerStudio `msEnvelope_1.0`) + auto-detected `SPI1` NOR Flash (`PY25Q64HA`/`W25Q64`) & Stage 2 FRAM (`FM25V02A`/`MB85RS256B`) (`CalibrationBlob` + `KnockConfig`/`AuxIoConfig`) + `ClearFaults` | Flash verified; FRAM ready |
 | **Bosch LSU 4.9 Wideband Hardware Driver** | `DAC1` (`PA4`/`PA5`), `TIM15` `4 kHz` Nernst `Ri` AC (`PE5`), `ADC2` synchronous injected sampling (`PA6`/`PA7`), `TIM17` `100 Hz` heater PWM (`PB9`) | Closed-loop bench validated |
 | **Knock Window DSP & `SDMMC1` `.BDL` Logger** | `ADC3` `200 kS/s` `TIM6/7` + `BDMA_CH0` -> `.sram4` (`41k+` windows, `0` overruns on high-RPM sweep) & non-blocking `SDMMC1` 4-bit FAT32 (`500 Hz` `.BDL`, `0` drops) + `LSE` `RTC` | Verified on live STM32H743 |
 | **Vehicle Bus, Honda DLC & Aux I/O** | `FDCAN1` `500 kbps` (`0x640..0x642`), `USART1` `9600 bps` `D7 DLC`, `EXTI` (`PB7` `ALTF*`, `PE15` Flex Fuel), aux low-side drivers (`ALTC*`, `IAB*`, `EVAP*`, `PE0`/`PE1`) | Boot & `FDCAN1` loopback verified; external harness pending |
-| **Remaining Roadmap** | External Knock AFE (`PC2_C`) & transceiver/LSU4.9 bench tests, `SPI1` FRAM (`FM25V02A`) mode, Stage 2 OBD1 PCB & in-car commissioning | Planned |
+| **Remaining Roadmap** | External Knock AFE (`PC2_C`) & transceiver/LSU4.9/FRAM physical tests, Stage 2 OBD1 KiCad PCB & in-car commissioning | Planned |
 
 ---
 
@@ -103,6 +103,7 @@ cargo run -p ecu-cli -- knock-status --port /dev/ttyACM0
 cargo run -p ecu-cli -- aux-status --port /dev/ttyACM0
 cargo run -p ecu-cli -- sd-status --port /dev/ttyACM0
 cargo run -p ecu-cli -- clear-faults --port /dev/ttyACM0
+cargo run -p ecu-cli -- nvm-status --port /dev/ttyACM0
 cargo run -p ecu-cli -- burn-config --port /dev/ttyACM0
 cargo run -p ecu-cli -- ts-check --port /dev/ttyACM0 --burn-test
 

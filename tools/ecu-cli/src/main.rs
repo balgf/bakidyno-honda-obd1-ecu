@@ -14,9 +14,9 @@ use ecu_core::datalog::{
 use ecu_core::sensors::{ADC_FULL_SCALE, VREF_VOLTS};
 use ecu_types::{CalibrationBlob, FaultFlags, RawSensorAdc, SwitchState, crc32};
 use proto_native::{
-    AuxStatusReport, KnockConfig, KnockStatusReport, MAX_CHUNK_BYTES, MAX_FRAME_BYTES, ProtoError,
-    Request, Response, SD_FORMAT_CONFIRM_MAGIC, SdDiskKind, SdStatusReport, decode_frame,
-    encode_frame,
+    AuxStatusReport, KnockConfig, KnockStatusReport, MAX_CHUNK_BYTES, MAX_FRAME_BYTES,
+    NvmStatusReport, ProtoError, Request, Response, SD_FORMAT_CONFIRM_MAGIC, SdDiskKind,
+    SdStatusReport, decode_frame, encode_frame,
 };
 use proto_tunerstudio::{
     TS_FLAG_BURN_OK, TS_FLAG_OK, TS_OCH_SIZE, TS_PAGE_SIZE, TS_PROTO_VERSION, TS_SIGNATURE,
@@ -133,8 +133,13 @@ enum Commands {
         #[arg(long, default_value = "/dev/ttyACM0")]
         port: String,
     },
-    /// Persist active Knock DSP and Auxiliary I/O runtime configurations to SPI1 Flash NVM
+    /// Persist active Knock DSP and Auxiliary I/O runtime configurations to SPI1 NVM
     BurnConfig {
+        #[arg(long, default_value = "/dev/ttyACM0")]
+        port: String,
+    },
+    /// Query auto-detected SPI1 NOR Flash / FRAM hardware identity and slot state
+    NvmStatus {
         #[arg(long, default_value = "/dev/ttyACM0")]
         port: String,
     },
@@ -1378,10 +1383,69 @@ fn run_aux_status(port_path: &str) -> Result<()> {
     }
 }
 
+fn format_rdid_hex(rdid: &[u8; 9], len: u8) -> String {
+    let count = usize::from(len).min(rdid.len());
+    if count == 0 {
+        return String::from("none");
+    }
+    let mut out = String::new();
+    for (idx, b) in rdid[..count].iter().enumerate() {
+        if idx > 0 {
+            out.push('-');
+        }
+        let _ = write!(out, "{b:02x}");
+    }
+    out
+}
+
+fn print_nvm_status(report: &NvmStatusReport) {
+    println!("SPI1 NVM Status Report");
+    println!("----------------------");
+    println!(
+        "Device     : {:?} | detected={} | capacity={} KB ({} B)",
+        report.medium,
+        report.detected,
+        report.capacity_bytes / 1024,
+        report.capacity_bytes
+    );
+    println!(
+        "SPI Format : RDID=[{}] | addr_bytes={} ({})",
+        format_rdid_hex(&report.rdid, report.rdid_len),
+        report.addr_bytes,
+        if report.addr_bytes == 2 {
+            "15/16-bit FRAM"
+        } else if report.addr_bytes == 3 {
+            "24-bit"
+        } else {
+            "unconfigured"
+        }
+    );
+    println!(
+        "Cal Region : active_slot={:?} | active_seq={}",
+        report.cal_active_slot, report.cal_active_seq
+    );
+    println!(
+        "Cfg Region : active_slot={:?} | active_seq={}",
+        report.cfg_active_slot, report.cfg_active_seq
+    );
+}
+
+fn run_nvm_status(port_path: &str) -> Result<()> {
+    let mut port = open_serial(port_path)?;
+    match native_rpc(&mut port, &Request::GetNvmStatus)? {
+        Response::NvmStatus(report) => {
+            print_nvm_status(&report);
+            Ok(())
+        }
+        Response::Error(err) => bail!("GetNvmStatus failed: {err:?}"),
+        other => bail!("unexpected GetNvmStatus response: {other:?}"),
+    }
+}
+
 fn run_burn_config(port_path: &str) -> Result<()> {
     let mut port = open_serial(port_path)?;
     commit_runtime_cfg(&mut port)?;
-    println!("Persisted active Knock DSP + Aux I/O configurations to SPI1 Flash NVM.");
+    println!("Persisted active Knock DSP + Aux I/O configurations to SPI1 NVM.");
     Ok(())
 }
 
@@ -1429,6 +1493,7 @@ fn main() -> Result<()> {
         Commands::ClearFaults { port } => run_clear_faults(&port),
         Commands::AuxStatus { port } => run_aux_status(&port),
         Commands::BurnConfig { port } => run_burn_config(&port),
+        Commands::NvmStatus { port } => run_nvm_status(&port),
     }
 }
 
@@ -1547,5 +1612,12 @@ mod tests {
             compute_rtc_fields(utc_2026_11_14, 28_800),
             (2026, 11, 14, 6, 8, 0, 0)
         );
+
+        let rdid = [0x7f, 0x7f, 0x7f, 0x7f, 0x7f, 0x7f, 0xc2, 0x22, 0x08];
+        assert_eq!(
+            super::format_rdid_hex(&rdid, 9),
+            "7f-7f-7f-7f-7f-7f-c2-22-08"
+        );
+        assert_eq!(super::format_rdid_hex(&rdid, 0), "none");
     }
 }

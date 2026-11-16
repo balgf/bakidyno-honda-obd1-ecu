@@ -25,7 +25,7 @@ use proto_tunerstudio::{
 use static_cell::StaticCell;
 
 use crate::ECU_STATE;
-use crate::nvm::NvmFlash;
+use crate::nvm::NvmStorage;
 use crate::sd_logger_hw::{
     SdCmd, SdCmdReply, parse_rpc_filename, run_sd_command, set_rtc_datetime, status_report,
     trigger_mark_event, update_cal_crc,
@@ -128,7 +128,7 @@ impl ProtocolBuffers {
 #[embassy_executor::task]
 pub async fn usb_protocol_task(
     mut cdc: CdcAcmClass<'static, UsbOtgFsDriver>,
-    mut nvm: NvmFlash<'static>,
+    mut nvm: NvmStorage<'static>,
 ) {
     let mut pkt = [0u8; USB_MAX_PACKET_SIZE];
     let mut bufs = ProtocolBuffers::new();
@@ -196,7 +196,7 @@ async fn process_usb_chunk(
     chunk: &[u8],
     bufs: &mut ProtocolBuffers,
     cdc: &mut CdcAcmClass<'static, UsbOtgFsDriver>,
-    nvm: &mut NvmFlash<'static>,
+    nvm: &mut NvmStorage<'static>,
 ) -> Result<(), EndpointError> {
     for &byte in chunk {
         match bufs.mode {
@@ -277,7 +277,7 @@ async fn handle_tunerstudio_frame(
     frame: &[u8],
     tx_buf: &mut [u8; MAX_TX_BUF],
     page_buf: &mut [u8; TS_PAGE_SIZE],
-    nvm: &mut NvmFlash<'static>,
+    nvm: &mut NvmStorage<'static>,
 ) -> usize {
     let touches_cal = frame.len() >= 3 && matches!(frame[2], b'R' | b'M' | b'W' | b'k' | b'B');
 
@@ -319,7 +319,7 @@ async fn handle_native_frame(
     frame: &[u8],
     tx_buf: &mut [u8; MAX_TX_BUF],
     page_buf: &mut [u8; TS_PAGE_SIZE],
-    nvm: &mut NvmFlash<'static>,
+    nvm: &mut NvmStorage<'static>,
 ) -> usize {
     let resp = match decode_frame(frame) {
         Ok(req) => dispatch_native_request(req, page_buf, nvm).await,
@@ -331,7 +331,7 @@ async fn handle_native_frame(
 async fn dispatch_native_request(
     req: Request,
     page_buf: &mut [u8; TS_PAGE_SIZE],
-    nvm: &mut NvmFlash<'static>,
+    nvm: &mut NvmStorage<'static>,
 ) -> Response {
     match req {
         Request::Ping { nonce } => {
@@ -532,6 +532,7 @@ async fn dispatch_native_request(
                 }
             }
         }
+        Request::GetNvmStatus => Response::NvmStatus(nvm.status_report()),
     }
 }
 

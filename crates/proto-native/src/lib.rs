@@ -5,7 +5,7 @@
 
 pub use ecu_types::{
     AltfState, AuxIoConfig, AuxIoTelemetry, AuxOutputs, AuxSpareMode, FlexFuelState,
-    FlexSensorStatus, KnockConfig, KnockTelemetry, RuntimeConfigBlob,
+    FlexSensorStatus, KnockConfig, KnockTelemetry, NvmMedium, NvmStatusReport, RuntimeConfigBlob,
 };
 use ecu_types::{TelemetrySnapshot, crc32};
 use heapless::Vec;
@@ -139,6 +139,8 @@ pub enum Request {
     },
     /// Persists active RAM `KnockConfig` + `AuxIoConfig` into dedicated `SPI1` NVM slots.
     CommitRuntimeConfigToNvm,
+    /// Reads detected `SPI1` NVM medium (`SpiNorFlash` vs `SpiFram`), RDID, capacity & slot info.
+    GetNvmStatus,
 }
 
 /// Live Knock Window DSP config & telemetry snapshot returned by [`Request::GetKnockStatus`].
@@ -185,6 +187,7 @@ pub enum Response {
     },
     KnockStatus(KnockStatusReport),
     AuxStatus(AuxStatusReport),
+    NvmStatus(NvmStatusReport),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -331,7 +334,8 @@ pub fn decode_runtime_config(bytes: &[u8]) -> Option<RuntimeConfigBlob> {
 mod tests {
     use ecu_types::{
         ActuatorOutputs, AuxIoConfig, AuxIoTelemetry, FaultFlags, KnockConfig, KnockTelemetry,
-        RuntimeConfigBlob, SensorSnapshot, SyncState, TelemetrySnapshot, VtecState, WidebandState,
+        NvmMedium, NvmStatusReport, RuntimeConfigBlob, SensorSnapshot, SyncState,
+        TelemetrySnapshot, VtecState, WidebandState,
     };
     use heapless::Vec;
 
@@ -548,5 +552,29 @@ mod tests {
         rt_cfg.aux.iab_engage_rpm = 5_900;
         let rt_len = encode_runtime_config(&rt_cfg, &mut rt_buf).expect("encode RuntimeConfigBlob");
         assert_eq!(decode_runtime_config(&rt_buf[..rt_len]), Some(rt_cfg));
+
+        let nvm_req_len =
+            encode_frame(&Request::GetNvmStatus, &mut wire).expect("encode GetNvmStatus");
+        assert_eq!(
+            decode_frame::<Request>(&wire[..nvm_req_len]),
+            Ok(Request::GetNvmStatus)
+        );
+        let nvm_resp = Response::NvmStatus(NvmStatusReport {
+            detected: true,
+            medium: NvmMedium::SpiFram,
+            rdid: [0x7f, 0x7f, 0x7f, 0x7f, 0x7f, 0x7f, 0xc2, 0x22, 0x08],
+            rdid_len: 9,
+            addr_bytes: 2,
+            capacity_bytes: 32_768,
+            cal_active_slot: Some(1),
+            cal_active_seq: 4,
+            cfg_active_slot: Some(0),
+            cfg_active_seq: 2,
+        });
+        let nvm_resp_len = encode_frame(&nvm_resp, &mut wire).expect("encode NvmStatus");
+        assert_eq!(
+            decode_frame::<Response>(&wire[..nvm_resp_len]),
+            Ok(nvm_resp)
+        );
     }
 }

@@ -15,6 +15,7 @@ pub mod fuel;
 pub mod ignition;
 pub mod knock;
 pub mod math;
+pub mod nvm_chip;
 pub mod sensors;
 pub mod trigger;
 pub mod vtec;

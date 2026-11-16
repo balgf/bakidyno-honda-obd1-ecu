@@ -1,14 +1,19 @@
 //! Non-volatile calibration & runtime configuration storage on onboard `SPI1` JEDEC NOR Flash
-//! (`Puya PY25Q64HA` / `Winbond W25Q64`, 8 MiB, 4 KB erase sectors).
+//! (`Puya PY25Q64HA` / `Winbond W25Q64`) or Stage 2 SPI FRAM (`FM25V02A` / `MB85RS256B`).
 //!
-//! Uses dual-sector ping-pong regions with monotonic generation sequence numbers, `CRC32`, and
-//! read-back verification so sudden power loss during erase/program never corrupts the active slot:
-//! - Calibration (`2,816 B` `CalibrationBlob`): `0x00_0000` & `0x00_1000`
-//! - Runtime Config (`KnockConfig` + `AuxIoConfig`): `0x00_2000` & `0x00_3000`
+//! Uses dual-slot ping-pong regions with monotonic generation sequence numbers, `CRC32`,
+//! commit-last headers, and read-back verification so sudden power loss during erase/program or
+//! FRAM byte writes never corrupts the active slot:
+//! - Calibration (`2,816 B` `CalibrationBlob`): `0x0000` & `0x1000`
+//! - Runtime Config (`KnockConfig` + `AuxIoConfig`): `0x2000` & `0x3000`
 
 use defmt::{info, warn};
+use ecu_core::nvm_chip::{
+    CAL_SLOT_ADDRS, CFG_SLOT_ADDRS, SLOT_HEADER_BYTES, SpiNvmGeometry, identify_rdid,
+};
 use ecu_types::{
-    CalibrationBlob, RUNTIME_CONFIG_MAGIC, RUNTIME_CONFIG_VERSION, RuntimeConfigBlob, crc32,
+    CalibrationBlob, NvmMedium, NvmStatusReport, RUNTIME_CONFIG_MAGIC, RUNTIME_CONFIG_VERSION,
+    RuntimeConfigBlob, crc32,
 };
 use embassy_stm32::Peri;
 use embassy_stm32::gpio::{Level, Output, Pull, Speed};
@@ -21,7 +26,6 @@ use embassy_time::Timer;
 use proto_native::{MAX_RUNTIME_CONFIG_BYTES, decode_runtime_config, encode_runtime_config};
 use proto_tunerstudio::{TS_PAGE_SIZE, pack_page, unpack_page_into};
 
-const CMD_WRITE_STATUS_DISABLE_NA: u8 = 0x04;
 const CMD_PAGE_PROGRAM: u8 = 0x02;
 const CMD_READ_DATA: u8 = 0x03;
 const CMD_READ_STATUS_1: u8 = 0x05;
@@ -35,10 +39,7 @@ const STATUS_WEL_MASK: u8 = 0x02;
 
 const CAL_NVM_MAGIC: u32 = 0x4349_564e;
 const CAL_SCHEMA_VERSION: u16 = 1;
-const HEADER_SIZE: usize = 16;
-const CAL_SECTOR_ADDRS: [u32; 2] = [0x00_0000, 0x00_1000];
-const CFG_SECTOR_ADDRS: [u32; 2] = [0x00_2000, 0x00_3000];
-const FLASH_PAGE_SIZE: usize = 256;
+const HEADER_SIZE: usize = SLOT_HEADER_BYTES;
 const WRITE_CHUNK_SIZE: usize = 128;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, defmt::Format)]
@@ -112,18 +113,19 @@ enum RegionId {
     RuntimeConfig,
 }
 
-/// Manages dual-sector ping-pong calibration & runtime config persistence over `SPI1` NOR Flash.
-pub struct NvmFlash<'d> {
+/// Manages auto-detected `SPI1` NOR Flash (`PY25Q64HA`/`W25Q64`) or FRAM (`FM25V02A`/`MB85RS256B`)
+/// dual-slot persistence.
+pub struct NvmStorage<'d> {
     spi: Spi<'d, Blocking, Master>,
     cs_n: Output<'d>,
-    jedec_id: [u8; 3],
-    detected: bool,
+    rdid: [u8; 9],
+    geometry: Option<SpiNvmGeometry>,
     cal_region: PingPongRegion,
     cfg_region: PingPongRegion,
 }
 
-impl<'d> NvmFlash<'d> {
-    /// Initializes `SPI1` (`PB3` SCK, `PD7` MOSI, `PB4` MISO, `PD6` CS#) and probes JEDEC ID.
+impl<'d> NvmStorage<'d> {
+    /// Initializes `SPI1` (`PB3` SCK, `PD7` MOSI, `PB4` MISO, `PD6` CS#) and auto-detects Flash vs FRAM.
     pub async fn init(
         spi1: Peri<'d, peripherals::SPI1>,
         sck: Peri<'d, peripherals::PB3>,
@@ -143,36 +145,53 @@ impl<'d> NvmFlash<'d> {
         let mut nvm = Self {
             spi,
             cs_n,
-            jedec_id: [0; 3],
-            detected: false,
-            cal_region: PingPongRegion::new(CAL_SECTOR_ADDRS, CAL_NVM_MAGIC, CAL_SCHEMA_VERSION),
+            rdid: [0; 9],
+            geometry: None,
+            cal_region: PingPongRegion::new(CAL_SLOT_ADDRS, CAL_NVM_MAGIC, CAL_SCHEMA_VERSION),
             cfg_region: PingPongRegion::new(
-                CFG_SECTOR_ADDRS,
+                CFG_SLOT_ADDRS,
                 RUNTIME_CONFIG_MAGIC,
                 RUNTIME_CONFIG_VERSION,
             ),
         };
 
-        // Wake flash cleanly in case a brownout left it in Deep Power-Down mode.
+        // Release Flash deep power-down (`0xAB`) AND pulse `CS#` to wake FRAM (`FM25V02A` tREC <= 400 us).
+        // `0xAB` is an unassigned non-write opcode on `FM25V02A` / `MB85RS256B`.
         let _ = nvm.with_cs(|spi| spi.blocking_write(&[CMD_RELEASE_POWERDOWN, 0, 0, 0]));
-        Timer::after_micros(50).await;
+        Timer::after_micros(500).await;
 
-        let mut id = [0u8; 3];
-        if nvm.read_jedec_id(&mut id).is_ok() && id[0] != 0x00 && id[0] != 0xff {
-            nvm.jedec_id = id;
-            nvm.detected = true;
-            info!(
-                "SPI1 NOR Flash detected | JEDEC={=u8:02x}-{=u8:02x}-{=u8:02x}",
-                id[0], id[1], id[2]
-            );
+        let mut raw_id = [0u8; 9];
+        if nvm.read_rdid_9(&mut raw_id).is_ok()
+            && let Some(geom) = identify_rdid(&raw_id)
+        {
+            nvm.rdid = raw_id;
+            nvm.geometry = Some(geom);
+            match geom.medium {
+                NvmMedium::SpiFram => info!(
+                    "SPI1 FRAM detected | size={} KB addr={}B rdid={=u8:02x}-{=u8:02x}-{=u8:02x}-{=u8:02x}",
+                    geom.capacity_bytes / 1024,
+                    geom.addr_bytes,
+                    raw_id[0],
+                    raw_id[6],
+                    raw_id[7],
+                    raw_id[2],
+                ),
+                NvmMedium::SpiNorFlash => info!(
+                    "SPI1 NOR Flash detected | size={} KB JEDEC={=u8:02x}-{=u8:02x}-{=u8:02x}",
+                    geom.capacity_bytes / 1024,
+                    raw_id[0],
+                    raw_id[1],
+                    raw_id[2]
+                ),
+                NvmMedium::None => {}
+            }
         } else {
             warn!(
-                "SPI1 NOR Flash absent or unreadable \
-                 (JEDEC={=u8:02x}-{=u8:02x}-{=u8:02x}); running RAM-only",
-                id[0], id[1], id[2]
+                "SPI1 NVM absent or unsupported \
+                 (RDID={=u8:02x}-{=u8:02x}-{=u8:02x}-{=u8:02x}); running RAM-only",
+                raw_id[0], raw_id[1], raw_id[2], raw_id[3]
             );
         }
-        let _ = CMD_WRITE_STATUS_DISABLE_NA;
         nvm
     }
 
@@ -237,12 +256,23 @@ impl<'d> NvmFlash<'d> {
             .await
     }
 
-    pub fn jedec_id(&self) -> [u8; 3] {
-        self.jedec_id
-    }
-
-    pub fn is_detected(&self) -> bool {
-        self.detected
+    pub fn status_report(&self) -> NvmStatusReport {
+        let (detected, medium, rdid_len, addr_bytes, capacity_bytes) = match self.geometry {
+            Some(g) => (true, g.medium, g.rdid_len, g.addr_bytes, g.capacity_bytes),
+            None => (false, NvmMedium::None, 0, 0, 0),
+        };
+        NvmStatusReport {
+            detected,
+            medium,
+            rdid: self.rdid,
+            rdid_len,
+            addr_bytes,
+            capacity_bytes,
+            cal_active_slot: self.cal_region.active_slot.map(|s| s as u8),
+            cal_active_seq: self.cal_region.active_seq,
+            cfg_active_slot: self.cfg_region.active_slot.map(|s| s as u8),
+            cfg_active_seq: self.cfg_region.active_seq,
+        }
     }
 
     fn region(&self, id: RegionId) -> PingPongRegion {
@@ -265,9 +295,7 @@ impl<'d> NvmFlash<'d> {
         scratch: &mut [u8],
         exact_len: Option<usize>,
     ) -> Option<(usize, u32, usize)> {
-        if !self.detected {
-            return None;
-        }
+        self.geometry?;
 
         let region = self.region(id);
         let mut best: Option<(usize, u32, usize)> = None;
@@ -317,9 +345,7 @@ impl<'d> NvmFlash<'d> {
     }
 
     async fn save_region_payload(&mut self, id: RegionId, payload: &[u8]) -> Result<(), NvmError> {
-        if !self.detected {
-            return Err(NvmError::NotDetected);
-        }
+        let geom = self.geometry.ok_or(NvmError::NotDetected)?;
 
         let region = self.region(id);
         let next_slot = match region.active_slot {
@@ -328,6 +354,11 @@ impl<'d> NvmFlash<'d> {
         };
         let next_seq = region.active_seq.wrapping_add(1).max(1);
         let sector_addr = region.sectors[next_slot];
+        if sector_addr.saturating_add(HEADER_SIZE as u32 + payload.len() as u32)
+            > geom.capacity_bytes
+        {
+            return Err(NvmError::VerifyFailed);
+        }
 
         let payload_crc32 = crc32(payload);
         let hdr = SlotHeader {
@@ -339,10 +370,24 @@ impl<'d> NvmFlash<'d> {
         }
         .to_bytes();
 
-        self.erase_sector_4k(sector_addr).await?;
-        self.program_range(sector_addr, &hdr).await?;
+        if geom.requires_erase {
+            self.erase_sector_4k(sector_addr).await?;
+        } else {
+            // Invalidate the inactive FRAM slot header before writing payload so a mid-write
+            // brownout leaves the alternate slot intact and cleanly rejects the torn header.
+            self.program_range(sector_addr, &[0xffu8; HEADER_SIZE])
+                .await?;
+        }
+        // Write payload before committing the magic/CRC header.
         self.program_range(sector_addr + HEADER_SIZE as u32, payload)
             .await?;
+        self.program_range(sector_addr, &hdr).await?;
+
+        let mut verify_hdr = [0u8; HEADER_SIZE];
+        self.read_bytes(sector_addr, &mut verify_hdr)?;
+        if verify_hdr != hdr {
+            return Err(NvmError::VerifyFailed);
+        }
 
         let mut verify_buf = [0u8; WRITE_CHUNK_SIZE];
         let mut offset = 0usize;
@@ -356,7 +401,7 @@ impl<'d> NvmFlash<'d> {
                 return Err(NvmError::VerifyFailed);
             }
             offset += chunk_len;
-            Timer::after_millis(1).await;
+            Timer::after_micros(50).await;
         }
 
         let reg_mut = self.region_mut(id);
@@ -382,10 +427,21 @@ impl<'d> NvmFlash<'d> {
         res.map_err(|_| NvmError::SpiBus)
     }
 
-    fn read_jedec_id(&mut self, id: &mut [u8; 3]) -> Result<(), NvmError> {
-        let mut buf = [CMD_READ_JEDEC_ID, 0, 0, 0];
+    fn send_cmd_addr(
+        spi: &mut Spi<'d, Blocking, Master>,
+        geom: SpiNvmGeometry,
+        opcode: u8,
+        addr: u32,
+    ) -> Result<(), SpiError> {
+        let mut cmd = [0u8; 4];
+        let len = geom.format_cmd_addr(opcode, addr, &mut cmd);
+        spi.blocking_write(&cmd[..len])
+    }
+
+    fn read_rdid_9(&mut self, id: &mut [u8; 9]) -> Result<(), NvmError> {
+        let mut buf = [CMD_READ_JEDEC_ID, 0, 0, 0, 0, 0, 0, 0, 0, 0];
         self.with_cs(|spi| spi.blocking_transfer_in_place(&mut buf))?;
-        id.copy_from_slice(&buf[1..4]);
+        id.copy_from_slice(&buf[1..10]);
         Ok(())
     }
 
@@ -415,35 +471,39 @@ impl<'d> NvmFlash<'d> {
     }
 
     async fn erase_sector_4k(&mut self, addr: u32) -> Result<(), NvmError> {
+        let geom = self.geometry.ok_or(NvmError::NotDetected)?;
         self.write_enable()?;
-        let a = addr.to_be_bytes();
-        self.with_cs(|spi| spi.blocking_write(&[CMD_SECTOR_ERASE_4K, a[1], a[2], a[3]]))?;
+        self.with_cs(|spi| Self::send_cmd_addr(spi, geom, CMD_SECTOR_ERASE_4K, addr))?;
         self.wait_not_busy(250).await
     }
 
     async fn program_range(&mut self, start_addr: u32, data: &[u8]) -> Result<(), NvmError> {
+        let geom = self.geometry.ok_or(NvmError::NotDetected)?;
         let mut offset = 0usize;
         while offset < data.len() {
             let addr = start_addr + offset as u32;
-            let page_rem = FLASH_PAGE_SIZE - ((addr as usize) % FLASH_PAGE_SIZE);
-            let chunk_len = page_rem.min(WRITE_CHUNK_SIZE).min(data.len() - offset);
+            let chunk_len = geom.write_chunk_limit(addr, WRITE_CHUNK_SIZE, data.len() - offset);
 
             self.write_enable()?;
-            let a = addr.to_be_bytes();
             self.with_cs(|spi| {
-                spi.blocking_write(&[CMD_PAGE_PROGRAM, a[1], a[2], a[3]])?;
+                Self::send_cmd_addr(spi, geom, CMD_PAGE_PROGRAM, addr)?;
                 spi.blocking_write(&data[offset..offset + chunk_len])
             })?;
-            self.wait_not_busy(25).await?;
+            if geom.requires_erase {
+                self.wait_not_busy(25).await?;
+            } else {
+                // FRAM writes latch on the last SCK edge with zero busy wait; yield briefly.
+                Timer::after_micros(10).await;
+            }
             offset += chunk_len;
         }
         Ok(())
     }
 
     fn read_bytes(&mut self, addr: u32, dst: &mut [u8]) -> Result<(), NvmError> {
-        let a = addr.to_be_bytes();
+        let geom = self.geometry.ok_or(NvmError::NotDetected)?;
         self.with_cs(|spi| {
-            spi.blocking_write(&[CMD_READ_DATA, a[1], a[2], a[3]])?;
+            Self::send_cmd_addr(spi, geom, CMD_READ_DATA, addr)?;
             spi.blocking_read(dst)
         })
     }

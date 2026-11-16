@@ -800,6 +800,38 @@ impl RuntimeConfigBlob {
     }
 }
 
+/// Physical non-volatile storage medium detected on `SPI1`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+pub enum NvmMedium {
+    /// No `SPI1` NVM device responded to JEDEC `RDID (0x9F)` (running RAM-only).
+    #[default]
+    None,
+    /// Standard JEDEC `SPI` NOR Flash (`PY25Q64HA`, `W25Q64`, etc.; 24-bit addr + 4 KB erase).
+    SpiNorFlash,
+    /// Ferroelectric RAM (`FM25V02A`, `MB85RS256B`, etc.; instant byte writes, no erase).
+    SpiFram,
+}
+
+/// Live `SPI1` non-volatile memory hardware & ping-pong slot summary reported over USB RPC.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+pub struct NvmStatusReport {
+    pub detected: bool,
+    pub medium: NvmMedium,
+    /// Raw `RDID (0x9F)` identification bytes (`3 B` NOR Flash, `4 B` Fujitsu FRAM, `9 B` Cypress).
+    pub rdid: [u8; 9],
+    pub rdid_len: u8,
+    /// Number of SPI address bytes transmitted after `READ`/`WRITE` opcodes (`2` or `3`).
+    pub addr_bytes: u8,
+    /// Decoded total chip capacity in bytes (`0` if capacity could not be decoded).
+    pub capacity_bytes: u32,
+    pub cal_active_slot: Option<u8>,
+    pub cal_active_seq: u32,
+    pub cfg_active_slot: Option<u8>,
+    pub cfg_active_seq: u32,
+}
+
 /// Computes IEEE 802.3 CRC-32 over an arbitrary byte slice.
 #[inline]
 pub fn crc32(bytes: &[u8]) -> u32 {
