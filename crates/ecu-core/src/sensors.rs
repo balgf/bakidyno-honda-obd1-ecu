@@ -61,6 +61,9 @@ impl InvertedMcuSwitchPins {
     }
 }
 
+/// Consecutive out-of-range `1 kHz` samples required before latching an analog sensor fault.
+pub const RANGE_FAULT_DEBOUNCE_TICKS: u8 = 20;
+
 /// Stateful `1 kHz` analog sensor conditioner with IIR noise filtering & range fault detection.
 pub struct SensorProcessor {
     map_lpf: LowPassFilter,
@@ -68,6 +71,11 @@ pub struct SensorProcessor {
     ect_lpf: LowPassFilter,
     iat_lpf: LowPassFilter,
     vbatt_lpf: LowPassFilter,
+    vcc_5v_lpf: LowPassFilter,
+    map_bad_ticks: u8,
+    tps_bad_ticks: u8,
+    ect_bad_ticks: u8,
+    iat_bad_ticks: u8,
     /// Calibration voltages (`0.0..5.0V` ratiometric) for closed/wide-open Honda `D11 TPS`.
     pub tps_closed_v: f32,
     pub tps_wot_v: f32,
@@ -87,9 +95,23 @@ impl SensorProcessor {
             ect_lpf: LowPassFilter::new(0.05),
             iat_lpf: LowPassFilter::new(0.05),
             vbatt_lpf: LowPassFilter::new(0.10),
+            vcc_5v_lpf: LowPassFilter::new(0.05),
+            map_bad_ticks: 0,
+            tps_bad_ticks: 0,
+            ect_bad_ticks: 0,
+            iat_bad_ticks: 0,
             tps_closed_v: 0.45,
             tps_wot_v: 4.50,
         }
+    }
+
+    /// Resets range-fault debounce counters (used after clearing MIL codes).
+    #[inline]
+    pub fn reset_fault_counters(&mut self) {
+        self.map_bad_ticks = 0;
+        self.tps_bad_ticks = 0;
+        self.ect_bad_ticks = 0;
+        self.iat_bad_ticks = 0;
     }
 
     #[inline]
@@ -126,9 +148,9 @@ impl SensorProcessor {
         // 1. Measure actual `D19/D20 VCC1/2` 5V rail via `PA0` (`12k/20k` divider)
         let vcc_5v_measured = Self::adc_to_pin_volts(raw.vcc_5v_raw) * SENSOR_DIVIDER_GAIN_INV;
         let vcc_5v = if (4.50..=5.50).contains(&vcc_5v_measured) {
-            vcc_5v_measured
+            self.vcc_5v_lpf.update(vcc_5v_measured)
         } else {
-            5.000
+            self.vcc_5v_lpf.update(5.000)
         };
 
         // Helper: ratiometric normalized 0..5.000V voltage (cancels 5V LDO drift!)
@@ -139,35 +161,47 @@ impl SensorProcessor {
 
         // 2. D17 MAP
         let map_v = to_ratiometric_5v(raw.map_raw);
-        if !(0.10..=4.92).contains(&map_v) {
-            faults.insert(FaultFlags::MAP_RANGE);
-        }
+        debounce_range_fault(
+            !(0.10..=4.92).contains(&map_v),
+            &mut self.map_bad_ticks,
+            FaultFlags::MAP_RANGE,
+            faults,
+        );
         let map_raw_kpa =
             map_cal.kpa_at_0v + (map_v / 5.0) * (map_cal.kpa_at_5v - map_cal.kpa_at_0v);
         let map_kpa = self.map_lpf.update(map_raw_kpa.clamp(10.0, 320.0));
 
         // 3. D11 TPS
         let tps_v = to_ratiometric_5v(raw.tps_raw);
-        if !(0.10..=4.92).contains(&tps_v) {
-            faults.insert(FaultFlags::TPS_RANGE);
-        }
+        debounce_range_fault(
+            !(0.10..=4.92).contains(&tps_v),
+            &mut self.tps_bad_ticks,
+            FaultFlags::TPS_RANGE,
+            faults,
+        );
         let tps_span = (self.tps_wot_v - self.tps_closed_v).max(0.5);
         let tps_raw_pct = ((tps_v - self.tps_closed_v) / tps_span * 100.0).clamp(0.0, 100.0);
         let tps_pct = self.tps_lpf.update(tps_raw_pct);
 
         // 4. D13 ECT & D15 IAT (compensating 32 kΩ parallel divider load!)
         let ect_ratio = (Self::adc_to_pin_volts(raw.ect_raw) * SENSOR_DIVIDER_GAIN_INV) / vcc_5v;
-        if !(0.01..=0.99).contains(&ect_ratio) {
-            faults.insert(FaultFlags::ECT_RANGE);
-        }
+        debounce_range_fault(
+            !(0.01..=0.99).contains(&ect_ratio),
+            &mut self.ect_bad_ticks,
+            FaultFlags::ECT_RANGE,
+            faults,
+        );
         let ect_c = self
             .ect_lpf
             .update(Self::honda_ntc_temp_c(ect_ratio).clamp(-40.0, 150.0));
 
         let iat_ratio = (Self::adc_to_pin_volts(raw.iat_raw) * SENSOR_DIVIDER_GAIN_INV) / vcc_5v;
-        if !(0.01..=0.99).contains(&iat_ratio) {
-            faults.insert(FaultFlags::IAT_RANGE);
-        }
+        debounce_range_fault(
+            !(0.01..=0.99).contains(&iat_ratio),
+            &mut self.iat_bad_ticks,
+            FaultFlags::IAT_RANGE,
+            faults,
+        );
         let iat_c = self
             .iat_lpf
             .update(Self::honda_ntc_temp_c(iat_ratio).clamp(-40.0, 130.0));
@@ -191,6 +225,23 @@ impl SensorProcessor {
             vss_kmh: vss_kmh.max(0.0),
             switches,
         }
+    }
+}
+
+#[inline]
+fn debounce_range_fault(
+    out_of_range: bool,
+    counter: &mut u8,
+    fault_bit: u32,
+    faults: &mut FaultFlags,
+) {
+    if out_of_range {
+        *counter = counter.saturating_add(1);
+        if *counter >= RANGE_FAULT_DEBOUNCE_TICKS {
+            faults.insert(fault_bit);
+        }
+    } else {
+        *counter = 0;
     }
 }
 
@@ -280,7 +331,7 @@ mod tests {
         assert!((s1.ect_c - s2.ect_c).abs() < 0.05);
         assert!((s1.iat_c - s2.iat_c).abs() < 0.05);
 
-        // Open/shorted sensor channels trigger range fault flags
+        // Open/shorted sensor channels reject 1 ms glitches and latch after debounce window
         let shorted = RawSensorAdc {
             vcc_5v_raw: volts_5v_to_adc(5.00),
             map_raw: 0,
@@ -290,6 +341,15 @@ mod tests {
             ..Default::default()
         };
         let _ = proc_5v0.process(&shorted, SwitchState::default(), 0.0, &map_cal, &mut faults);
+        assert!(faults.is_empty());
+
+        // Recovery clears debounce counter so transient spikes never accumulate
+        let _ = proc_5v0.process(&raw_5v0, SwitchState::default(), 0.0, &map_cal, &mut faults);
+        assert!(faults.is_empty());
+
+        for _ in 0..super::RANGE_FAULT_DEBOUNCE_TICKS {
+            let _ = proc_5v0.process(&shorted, SwitchState::default(), 0.0, &map_cal, &mut faults);
+        }
         assert!(faults.contains(FaultFlags::MAP_RANGE));
         assert!(faults.contains(FaultFlags::TPS_RANGE));
         assert!(faults.contains(FaultFlags::ECT_RANGE));

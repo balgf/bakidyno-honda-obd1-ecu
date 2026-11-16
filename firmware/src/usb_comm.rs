@@ -494,6 +494,10 @@ async fn dispatch_native_request(
             ECU_STATE.lock().await.ecu.set_knock_config(config);
             Response::Ack
         }
+        Request::ClearFaults => {
+            ECU_STATE.lock().await.ecu.clear_faults();
+            Response::Ack
+        }
     }
 }
 

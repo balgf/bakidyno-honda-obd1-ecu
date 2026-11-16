@@ -20,8 +20,9 @@ use embassy_stm32::dma;
 use embassy_stm32::interrupt::typelevel::Binding;
 use embassy_stm32::peripherals::{ADC1, DMA1_CH0, PA0, PA2, PA3, PC0, PC1, PC4, PC5};
 
-/// Sample time per channel (`64.5` cycles + `8.5` conversion = `73` ADC cycles @ `48 MHz`).
-const SENSOR_SAMPLE_TIME: SampleTime = SampleTime::CYCLES64_5;
+/// Sample time per channel (`810.5` cycles + `8.5` conversion = `819` ADC cycles @ `48 MHz`,
+/// `~17 us/ch`, `~125 us` total across 7 channels, eliminating high-impedance MUX charge carryover).
+const SENSOR_SAMPLE_TIME: SampleTime = SampleTime::CYCLES810_5;
 /// Number of `ADC1` regular-sequence channels scanned per `1 kHz` cycle.
 const ADC1_CHANNEL_COUNT: usize = 7;
 

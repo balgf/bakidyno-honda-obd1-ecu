@@ -126,6 +126,8 @@ pub enum Request {
     SetKnockConfig {
         config: KnockConfig,
     },
+    /// Clears latched RAM MIL fault flags while leaving sensor plausibility & lockouts active.
+    ClearFaults,
 }
 
 /// Live Knock Window DSP config & telemetry snapshot returned by [`Request::GetKnockStatus`].
@@ -477,5 +479,11 @@ mod tests {
         });
         let krlen = encode_frame(&k_resp, &mut wire).expect("encode KnockStatus");
         assert_eq!(decode_frame::<Response>(&wire[..krlen]), Ok(k_resp));
+
+        let clr_len = encode_frame(&Request::ClearFaults, &mut wire).expect("encode ClearFaults");
+        assert_eq!(
+            decode_frame::<Request>(&wire[..clr_len]),
+            Ok(Request::ClearFaults)
+        );
     }
 }

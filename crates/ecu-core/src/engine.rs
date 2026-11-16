@@ -262,6 +262,13 @@ impl EngineCoordinator {
         self.timing_override_deg_x10 = override_deg_x10;
     }
 
+    /// Clears latched RAM MIL flags without bypassing active safety lockouts.
+    #[inline]
+    pub fn clear_faults(&mut self) {
+        self.latest_faults = FaultFlags(0);
+        self.sensors_proc.reset_fault_counters();
+    }
+
     #[inline]
     pub fn process_knock_window(&mut self, cyl: Cylinder, rpm: u16, samples: &[u16]) -> bool {
         self.knock.process_window(cyl, rpm, samples)
@@ -813,5 +820,47 @@ mod tests {
         assert!(snap.faults.is_empty());
         assert_eq!(cycle1_sparks, [1; 4]);
         assert_eq!(cycle1_inj, [1; 4]);
+    }
+
+    #[test]
+    fn clear_faults_resets_latched_mil_without_defeating_vtec_lockout() {
+        let mut cal = CalibrationBlob::default_honda_obd1();
+        cal.vtec.require_vtp_pressure_switch = true;
+        cal.vtec.vtp_confirm_timeout_ms = 5;
+        let mut ecu = EngineCoordinator::new();
+
+        // Sync up to 5,200 RPM with VTP missing so VTEC enters FaultLockout + latches Code 22
+        let mut ts = 1_000_000u32;
+        let tooth_us = 961u32;
+        let mut wot_adc = nominal_raw_adc(0.45, 4.30);
+        wot_adc.map_raw = volts_5v_to_adc(3.10);
+        for cycle in 0..3 {
+            for tooth in 0..24 {
+                if tooth == 0 {
+                    ecu.on_cyp_capture(ts.wrapping_sub(50));
+                }
+                if tooth % 6 == 0 {
+                    ecu.on_tdc_capture(ts.wrapping_sub(25));
+                }
+                let _ = ecu.on_ckp_capture(ts, &cal);
+                ts += tooth_us;
+                if cycle == 2 {
+                    let _ = ecu.tick_1khz(ts, &wot_adc, SwitchState::default(), 75.0, false, &cal);
+                }
+            }
+        }
+        assert!(ecu.snapshot().faults.contains(FaultFlags::VTP_OIL_PRESSURE));
+        assert_eq!(
+            ecu.snapshot().vtec_state,
+            ecu_types::VtecState::FaultLockout
+        );
+
+        // Clearing MIL codes resets the fault mask cleanly while leaving VTEC lockout protected
+        ecu.clear_faults();
+        assert!(ecu.snapshot().faults.is_empty());
+        assert_eq!(
+            ecu.snapshot().vtec_state,
+            ecu_types::VtecState::FaultLockout
+        );
     }
 }

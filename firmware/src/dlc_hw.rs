@@ -8,7 +8,7 @@
 use core::sync::atomic::{AtomicU32, Ordering};
 
 use defmt::warn;
-use ecu_core::dlc::{DLC_BAUDRATE_BPS, DlcParser, encode_dlc_response};
+use ecu_core::dlc::{DLC_BAUDRATE_BPS, DlcCommand, DlcParser, encode_dlc_response};
 use embassy_stm32::Peri;
 use embassy_stm32::gpio::Pull;
 use embassy_stm32::peripherals::{PA9, PA10, USART1};
@@ -84,7 +84,10 @@ pub async fn dlc_uart_task(mut uart: BufferedUart<'static>) -> ! {
 
         if let Some(cmd) = parser.push_byte(byte[0]) {
             let (snap, aux) = {
-                let state = ECU_STATE.lock().await;
+                let mut state = ECU_STATE.lock().await;
+                if cmd == DlcCommand::ClearFaults {
+                    state.ecu.clear_faults();
+                }
                 (state.ecu.snapshot(), state.aux_telemetry)
             };
             let resp = encode_dlc_response(cmd, &snap, &aux);
