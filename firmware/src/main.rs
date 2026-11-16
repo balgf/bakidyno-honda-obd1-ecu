@@ -16,6 +16,7 @@ mod dlc_hw;
 mod knock_hw;
 mod nvm;
 mod outputs;
+mod rt_trigger;
 mod sd_logger_hw;
 mod sensors_adc;
 mod usb_comm;
@@ -28,17 +29,15 @@ use ecu_core::sensors::InvertedMcuSwitchPins;
 use ecu_types::{CalibrationBlob, SyncState, WidebandState};
 use embassy_executor::Spawner;
 use embassy_stm32::gpio::{Input, Level, Output, Pull, Speed};
+use embassy_stm32::interrupt::typelevel::Interrupt;
 use embassy_stm32::rcc::mux::{Adcsel, Fdcansel, Sdmmcsel, Usbsel};
 use embassy_stm32::rcc::{
     AHBPrescaler, APBPrescaler, Hse, HseMode, LsConfig, Pll, PllDiv, PllMul, PllPreDiv, PllSource,
     Sysclk, VoltageScale,
 };
 use embassy_stm32::time::Hertz;
-use embassy_stm32::timer::Channel;
-use embassy_stm32::timer::input_capture::{CapturePin, InputCapture};
-use embassy_stm32::timer::low_level::{CountingMode, InputCaptureMode, InputTISelection};
 use embassy_stm32::{
-    Config, bind_interrupts, can, dma, exti, interrupt, pac, peripherals, sdmmc, timer, usart, usb,
+    Config, bind_interrupts, can, dma, exti, interrupt, pac, peripherals, sdmmc, usart, usb,
 };
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::mutex::Mutex;
@@ -50,7 +49,7 @@ use sensors_adc::{Adc1SensorPins, Adc1Sensors};
 use {defmt_rtt as _, panic_probe as _};
 
 bind_interrupts!(struct Irqs {
-    TIM2 => timer::CaptureCompareInterruptHandler<peripherals::TIM2>;
+    TIM2 => rt_trigger::Tim2TriggerInterruptHandler;
     TIM1_CC => outputs::Tim1CopInterruptHandler;
     TIM3 => outputs::Tim3InjInterruptHandler;
     TIM15 => wideband_hw::Tim15WidebandInterruptHandler;
@@ -72,8 +71,6 @@ pub(crate) struct SharedEcuState {
     pub(crate) aux_cfg: AuxIoConfig,
     pub(crate) aux_telemetry: AuxIoTelemetry,
     pub(crate) cal: Option<CalibrationBlob>,
-    vss_kmh: f32,
-    last_vss_ts_us: Option<u32>,
 }
 
 pub(crate) static ECU_STATE: Mutex<CriticalSectionRawMutex, SharedEcuState> =
@@ -94,8 +91,6 @@ pub(crate) static ECU_STATE: Mutex<CriticalSectionRawMutex, SharedEcuState> =
             altf: ecu_core::aux_io::AltfState::new(),
         },
         cal: None,
-        vss_kmh: 0.0,
-        last_vss_ts_us: None,
     });
 
 /// Configures the `STM32H743VIT6` clock tree from the `25.000 MHz` external quartz crystal:
@@ -138,6 +133,8 @@ fn configure_h743_clocks() -> Config {
     config.rcc.mux.adcsel = Adcsel::PLL3_R;
     config.rcc.mux.fdcansel = Fdcansel::PLL1_Q;
     config.rcc.mux.sdmmcsel = Sdmmcsel::PLL1_Q;
+    config.dma_interrupt_priority = interrupt::Priority::P4;
+    config.bdma_interrupt_priority = interrupt::Priority::P3;
     config
 }
 
@@ -153,67 +150,29 @@ fn isolate_direct_adc3_pads() {
     });
 }
 
-/// Hard real-time `TIM2` (`1.000 MHz` 32-bit Input Capture) task decoding the Honda OBD1 `24/4/1`
-/// distributor signals (`PA15` `CKP`, `PA1` `TDC`, `PB10` `CYP`) and `PB11` `VSS`.
-#[embassy_executor::task]
-async fn tim2_trigger_task(mut tim2_ic: InputCapture<'static, peripherals::TIM2>) {
-    // Configure CH2 (`PA1 TDC`), CH3 (`PB10 CYP`), and CH4 (`PB11 VSS`) for hardware rising-edge
-    // timestamp latching into `TIM2->CCR2..4` without firing redundant IRQs before `CKP`.
-    for ch in [Channel::Ch2, Channel::Ch3, Channel::Ch4] {
-        tim2_ic.set_input_ti_selection(ch, InputTISelection::Normal);
-        tim2_ic.set_input_capture_mode(ch, InputCaptureMode::Rising);
-        tim2_ic.enable(ch);
-    }
-    pac::TIM2.sr().write(|_| {});
-
-    loop {
-        // Note: `embassy-stm32` `InputCaptureFuture::poll` reads `CCR` through `TimGp16` (16-bit),
-        // so we read the full 32-bit `TIM2->CCR1` via `get_capture_value(Channel::Ch1)` on wakeup.
-        let _ = tim2_ic.wait_for_rising_edge(Channel::Ch1).await;
-        let ckp_ts_us = tim2_ic.get_capture_value(Channel::Ch1);
-        let sr = pac::TIM2.sr().read();
-
-        let mut state = ECU_STATE.lock().await;
-        if sr.ccif(2) {
-            let cyp_ts_us = tim2_ic.get_capture_value(Channel::Ch3);
-            state.ecu.on_cyp_capture(cyp_ts_us);
-        }
-        if sr.ccif(1) {
-            let tdc_ts_us = tim2_ic.get_capture_value(Channel::Ch2);
-            state.ecu.on_tdc_capture(tdc_ts_us);
-        }
-        if sr.ccif(3) {
-            let vss_ts_us = tim2_ic.get_capture_value(Channel::Ch4);
-            if let Some(prev_vss) = state.last_vss_ts_us {
-                let dt_vss = vss_ts_us.wrapping_sub(prev_vss);
-                if dt_vss > 1_000 {
-                    state.vss_kmh = 1_448_000.0 / (dt_vss as f32);
-                }
-            }
-            state.last_vss_ts_us = Some(vss_ts_us);
-        }
-        pac::TIM2.sr().modify(|w| {
-            for ch in 0..4 {
-                w.set_ccof(ch, /* ccof= */ false);
-            }
-        });
-
-        let state_ref = &mut *state;
-        if let Some(ref cal) = state_ref.cal {
-            let tooth_out = state_ref.ecu.on_ckp_capture(ckp_ts_us, cal);
-            if let Some(ev) = tooth_out.event {
-                HardwareOutputs::schedule_tooth_outputs(ckp_ts_us, &tooth_out.cop, &tooth_out.inj);
-                if let Some(plan) = state_ref.ecu.knock.plan_on_ckp_tooth(&ev) {
-                    knock_hw::schedule_window(plan);
-                }
-            }
-        }
-    }
+/// Assigns explicit Cortex-M7 NVIC preemption hierarchy before peripheral initialization:
+/// - `P0` (highest): `TIM1_CC` (`COP`) & `TIM3` (`INJ`) compare outputs
+/// - `P1`: `TIM2` (`CKP`/`TDC`/`CYP`/`VSS`) trigger decoder & tooth compare arming
+/// - `P2`: `TIM15` (`Wideband Nernst` synchronous sample)
+/// - `P3`: `TIM7` & `BDMA_CHANNEL0` (`Knock` window capture)
+/// - `P4`: `SDMMC1`, `USB OTG_FS`, `FDCAN1`, `USART1`, `EXTI` (non-blocking / telemetry IRQs)
+fn configure_nvic_priorities() {
+    interrupt::typelevel::TIM1_CC::set_priority(interrupt::Priority::P0);
+    interrupt::typelevel::TIM3::set_priority(interrupt::Priority::P0);
+    interrupt::typelevel::TIM2::set_priority(interrupt::Priority::P1);
+    interrupt::typelevel::OTG_FS::set_priority(interrupt::Priority::P4);
+    interrupt::typelevel::SDMMC1::set_priority(interrupt::Priority::P4);
+    interrupt::typelevel::FDCAN1_IT0::set_priority(interrupt::Priority::P4);
+    interrupt::typelevel::FDCAN1_IT1::set_priority(interrupt::Priority::P4);
+    interrupt::typelevel::USART1::set_priority(interrupt::Priority::P4);
+    interrupt::typelevel::EXTI9_5::set_priority(interrupt::Priority::P4);
+    interrupt::typelevel::EXTI15_10::set_priority(interrupt::Priority::P4);
 }
 
 #[embassy_executor::main]
 async fn main(spawner: Spawner) {
     let p = embassy_stm32::init(configure_h743_clocks());
+    configure_nvic_priorities();
     isolate_direct_adc3_pads();
 
     // 1. SAFETY FIRST: Hold `PB15` (`ACTUATOR_OE_N` on 3x `SN74AHCT541`) HIGH (`DISABLED`)
@@ -246,20 +205,7 @@ async fn main(spawner: Spawner) {
     let vts_fault_n = Input::new(p.PB14, Pull::Up); // TPS1H100A-Q1 Active-Low Fault
 
     // 4. Initialize 32-bit `TIM2` (`1.000 MHz`) Input Capture & `TIM1/TIM3/TIM16/TIM4` outputs
-    let ckp_pin = CapturePin::new(p.PA15, Pull::Down); // B15/B16 CKP (24 teeth / 720°)
-    let tdc_pin = CapturePin::new(p.PA1, Pull::Down); // B13/B14 TDC (4 teeth / 720°)
-    let cyp_pin = CapturePin::new(p.PB10, Pull::Down); // B11/B12 CYP (1 tooth / 720°)
-    let vss_pin = CapturePin::new(p.PB11, Pull::Down); // B10 VSS Vehicle Speed
-    let tim2_ic = InputCapture::new(
-        p.TIM2,
-        Some(ckp_pin),
-        Some(tdc_pin),
-        Some(cyp_pin),
-        Some(vss_pin),
-        Irqs,
-        Hertz(1_000_000),
-        CountingMode::EdgeAlignedUp,
-    );
+    let tim2_hw = rt_trigger::Tim2TriggerHw::init(p.TIM2, p.PA15, p.PA1, p.PB10, p.PB11);
     let mut hw_outputs = HardwareOutputs::init(
         p.TIM1, p.PE9, p.PE11, p.PE13, p.PE14, p.TIM3, p.PC6, p.PC7, p.PB0, p.PB1, p.TIM16, p.PB8,
         p.TIM4, p.PD14, p.PD15, Irqs, Irqs,
@@ -307,7 +253,12 @@ async fn main(spawner: Spawner) {
     defmt::assert!(cal.validate_header());
     proto_tunerstudio::pack_page(&cal, &mut boot_page_buf);
     sd_logger_hw::update_cal_crc(ecu_types::crc32(&boot_page_buf));
-    ECU_STATE.lock().await.cal = Some(cal);
+    {
+        let mut state = ECU_STATE.lock().await;
+        let targets = state.ecu.export_rt_targets(&cal);
+        state.cal = Some(cal);
+        rt_trigger::update_targets(targets);
+    }
 
     let jid = nvm.jedec_id();
     let usb_init = usb_comm::init_cdc_acm(p.USB_OTG_FS, Irqs, p.PA12, p.PA11);
@@ -346,7 +297,8 @@ async fn main(spawner: Spawner) {
         jid[1],
         jid[2]
     );
-    spawner.spawn(tim2_trigger_task(tim2_ic).expect("valid tim2_trigger_task token"));
+    tim2_hw.arm_irq();
+    let _tim2_guard = tim2_hw;
     spawner
         .spawn(usb_comm::usb_device_task(usb_init.usb_dev).expect("valid usb_device_task token"));
     spawner.spawn(
@@ -388,17 +340,13 @@ async fn main(spawner: Spawner) {
         .decode();
 
         let now_us = pac::TIM2.cnt().read();
+        let (rt_status, vss_kmh) = rt_trigger::sync_1khz(now_us);
         let flex_sample = aux_io_hw::take_flex_sample();
         let altf_sample = aux_io_hw::take_altf_sample();
-        let (out, snap, aux_snap, faults_empty) = {
+        let (out, snap, aux_snap, faults_empty, rt_targets) = {
             let mut state = ECU_STATE.lock().await;
-            if let Some(last_vss) = state.last_vss_ts_us
-                && now_us.wrapping_sub(last_vss) > 1_000_000
-            {
-                state.vss_kmh = 0.0;
-            }
-            let vss_kmh = state.vss_kmh;
             let state_ref = &mut *state;
+            state_ref.ecu.apply_rt_status(rt_status);
             let Some(ref cal) = state_ref.cal else {
                 continue;
             };
@@ -420,8 +368,10 @@ async fn main(spawner: Spawner) {
                 &state_ref.aux_cfg,
             );
             state_ref.aux_telemetry = aux_snap;
-            (out, snap, aux_snap, snap.faults.is_empty())
+            let rt_targets = state_ref.ecu.export_rt_targets(cal);
+            (out, snap, aux_snap, snap.faults.is_empty(), rt_targets)
         };
+        rt_trigger::update_targets(rt_targets);
 
         HardwareOutputs::enforce_safety(snap.sync_state == SyncState::FullSynced720);
         hw_outputs.set_iacv_duty_per_mille(out.iacv_duty_per_mille);

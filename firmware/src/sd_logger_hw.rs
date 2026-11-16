@@ -11,7 +11,7 @@
 //!   `Request::FormatSdFat32` confirmation while `RPM == 0`.
 
 use core::cell::RefCell;
-use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, Ordering, fence};
 
 use defmt::{info, warn};
 use ecu_core::aux_io::AuxIoTelemetry;
@@ -27,6 +27,7 @@ use ecu_types::TelemetrySnapshot;
 use embassy_stm32::Peri;
 use embassy_stm32::gpio::{Flex, Input, Pull};
 use embassy_stm32::interrupt::typelevel::Binding;
+use embassy_stm32::pac;
 use embassy_stm32::peripherals::{PC8, PC9, PC10, PC11, PC12, PC13, PD2, PD4, RTC, SDMMC1};
 use embassy_stm32::rtc::{DateTime, DayOfWeek, Rtc, RtcConfig, RtcTimeProvider};
 use embassy_stm32::sdmmc::sd::{CmdBlock, DataBlock, StorageDevice};
@@ -397,10 +398,244 @@ pub fn init_hardware(
     (sdmmc, pd4, mark_btn)
 }
 
+const SD_CMD_SPIN_LIMIT: u32 = 2_000_000;
+const SD_WRITE_TIMEOUT_MS: u64 = 1_500;
+const SD_R1_READY_FOR_DATA: u32 = 0x100;
+
+fn clear_sdmmc1_flags(regs: pac::sdmmc::Sdmmc) {
+    regs.icr().write(|w| {
+        w.set_ccrcfailc(true);
+        w.set_dcrcfailc(true);
+        w.set_ctimeoutc(true);
+        w.set_dtimeoutc(true);
+        w.set_txunderrc(true);
+        w.set_rxoverrc(true);
+        w.set_cmdrendc(true);
+        w.set_cmdsentc(true);
+        w.set_dataendc(true);
+        w.set_dholdc(true);
+        w.set_dbckendc(true);
+        w.set_dabortc(true);
+        w.set_busyd0endc(true);
+        w.set_sdioitc(true);
+        w.set_ackfailc(true);
+        w.set_acktimeoutc(true);
+        w.set_vswendc(true);
+        w.set_ckstopc(true);
+        w.set_idmatec(true);
+        w.set_idmabtcc(true);
+    });
+}
+
+fn send_sdmmc1_cmd(
+    regs: pac::sdmmc::Sdmmc,
+    cmdindex: u8,
+    arg: u32,
+    waitresp: u8,
+    check_crc: bool,
+    cmdtrans: bool,
+    cmdstop: bool,
+) -> Result<u32, SdError> {
+    clear_sdmmc1_flags(regs);
+    let mut spin = SD_CMD_SPIN_LIMIT;
+    while regs.star().read().cpsmact() {
+        spin -= 1;
+        if spin == 0 {
+            return Err(SdError::SoftwareTimeout);
+        }
+    }
+
+    regs.argr().write(|w| w.set_cmdarg(arg));
+    regs.cmdr().write(|w| {
+        w.set_waitint(false);
+        w.set_waitresp(waitresp);
+        w.set_cmdindex(cmdindex);
+        w.set_cpsmen(true);
+        w.set_cmdstop(cmdstop);
+        w.set_cmdtrans(cmdtrans);
+    });
+
+    let mut status;
+    spin = SD_CMD_SPIN_LIMIT;
+    loop {
+        status = regs.star().read();
+        if waitresp == 0 {
+            if status.ctimeout() || status.cmdsent() {
+                break;
+            }
+        } else if status.ctimeout() || status.cmdrend() || status.ccrcfail() {
+            break;
+        }
+        spin -= 1;
+        if spin == 0 {
+            return Err(SdError::SoftwareTimeout);
+        }
+    }
+
+    if status.ctimeout() {
+        return Err(SdError::Timeout);
+    }
+    if check_crc && status.ccrcfail() {
+        return Err(SdError::Crc);
+    }
+    Ok(if waitresp == 0 {
+        0
+    } else {
+        regs.respr(0).read().cardstatus()
+    })
+}
+
+fn abort_sdmmc1_write(regs: pac::sdmmc::Sdmmc) {
+    regs.maskr().write(|_| {});
+    regs.idmactrlr().modify(|w| w.set_idmaen(/* val= */ false));
+    if regs.star().read().dpsmact() {
+        let _ = send_sdmmc1_cmd(
+            regs, /* cmdindex= */ 12, /* arg= */ 0, /* waitresp= */ 1,
+            /* check_crc= */ false, /* cmdtrans= */ false, /* cmdstop= */ true,
+        );
+        let mut spin = SD_CMD_SPIN_LIMIT;
+        while regs.star().read().dpsmact() && spin > 0 {
+            spin -= 1;
+        }
+    }
+    clear_sdmmc1_flags(regs);
+}
+
+async fn wait_sdmmc1_idle(regs: pac::sdmmc::Sdmmc) -> Result<(), SdError> {
+    let start = Instant::now();
+    while regs.star().read().dpsmact() || regs.star().read().cpsmact() {
+        if start.elapsed() > Duration::from_millis(SD_WRITE_TIMEOUT_MS) {
+            return Err(SdError::SoftwareTimeout);
+        }
+        Timer::after_micros(200).await;
+    }
+    Ok(())
+}
+
+async fn wait_card_ready_yield(regs: pac::sdmmc::Sdmmc, rca: u16) -> Result<(), SdError> {
+    let start = Instant::now();
+    loop {
+        if !regs.star().read().busyd0() {
+            let r1 = send_sdmmc1_cmd(
+                regs,
+                /* cmdindex= */ 13,
+                /* arg= */ (rca as u32) << 16,
+                /* waitresp= */ 1,
+                /* check_crc= */ true,
+                /* cmdtrans= */ false,
+                /* cmdstop= */ false,
+            )?;
+            if (r1 & SD_R1_READY_FOR_DATA) != 0 {
+                return Ok(());
+            }
+        }
+        if start.elapsed() > Duration::from_millis(SD_WRITE_TIMEOUT_MS) {
+            return Err(SdError::SoftwareTimeout);
+        }
+        Timer::after_micros(250).await;
+    }
+}
+
 struct SdStorageIo<'d, 's, 'a> {
     storage: &'d mut StorageDevice<'s, 'a, embassy_stm32::sdmmc::sd::Card>,
     dma_buf: &'d mut [DataBlock; DMA_BATCH_SECTORS],
     yield_every_batch: bool,
+}
+
+impl SdStorageIo<'_, '_, '_> {
+    /// Non-blocking `SDMMC1` IDMA + yielding `CMD13` write replacement for `embassy_stm32`'s
+    /// synchronous `0x00ff_ffff` `read_status()` busy-wait loop, so SD NAND programming stalls
+    /// (`10-130+ ms`) yield the Thread-Mode executor without freezing `1 kHz` control or `USB`.
+    async fn write_chunk_nonblocking(&mut self, lba: u32, n: usize) -> Result<(), SdError> {
+        let card = self.storage.card();
+        let address = if card.ocr.high_capacity() {
+            lba
+        } else {
+            lba.saturating_mul(512)
+        };
+        let regs = pac::SDMMC1;
+
+        wait_sdmmc1_idle(regs).await?;
+        regs.maskr().write(|_| {});
+        if regs.star().read().busyd0() {
+            wait_card_ready_yield(regs, card.rca).await?;
+        }
+
+        // CMD16: ensure 512-byte card block length matches IDMA transfer size.
+        send_sdmmc1_cmd(
+            regs, /* cmdindex= */ 16, /* arg= */ 512, /* waitresp= */ 1,
+            /* check_crc= */ true, /* cmdtrans= */ false, /* cmdstop= */ false,
+        )?;
+
+        clear_sdmmc1_flags(regs);
+        let byte_len = (n * 512) as u32;
+        regs.dlenr().write(|w| w.set_datalength(byte_len));
+        regs.idmabase0r()
+            .write(|w| w.set_idmabase0(self.dma_buf.as_ptr() as u32));
+        regs.idmactrlr().modify(|w| w.set_idmaen(/* val= */ true));
+        regs.dctrl().modify(|w| {
+            w.set_dtmode(0);
+            w.set_dblocksize(9); // 2^9 = 512 bytes per SD sector
+            w.set_dtdir(false); // Host -> Card
+        });
+        fence(Ordering::SeqCst);
+
+        let cmd_idx = if n == 1 { 24 } else { 25 };
+        if let Err(err) = send_sdmmc1_cmd(
+            regs, cmd_idx, address, /* waitresp= */ 1, /* check_crc= */ true,
+            /* cmdtrans= */ true, /* cmdstop= */ false,
+        ) {
+            abort_sdmmc1_write(regs);
+            return Err(err);
+        }
+
+        Timer::after_micros(if n == 1 { 60 } else { 300 }).await;
+        let xfer_start = Instant::now();
+        loop {
+            let st = regs.star().read();
+            if st.dcrcfail() {
+                abort_sdmmc1_write(regs);
+                return Err(SdError::Crc);
+            }
+            if st.dtimeout() {
+                abort_sdmmc1_write(regs);
+                return Err(SdError::Timeout);
+            }
+            if st.txunderr() {
+                abort_sdmmc1_write(regs);
+                return Err(SdError::Underrun);
+            }
+            if st.dabort() || st.idmate() {
+                abort_sdmmc1_write(regs);
+                return Err(SdError::SoftwareTimeout);
+            }
+            if st.dataend() {
+                break;
+            }
+            if xfer_start.elapsed() > Duration::from_millis(SD_WRITE_TIMEOUT_MS) {
+                abort_sdmmc1_write(regs);
+                return Err(SdError::SoftwareTimeout);
+            }
+            Timer::after_micros(200).await;
+        }
+
+        fence(Ordering::Acquire);
+        clear_sdmmc1_flags(regs);
+        regs.idmactrlr().modify(|w| w.set_idmaen(/* val= */ false));
+
+        if n > 1 {
+            if let Err(err) = send_sdmmc1_cmd(
+                regs, /* cmdindex= */ 12, /* arg= */ 0, /* waitresp= */ 1,
+                /* check_crc= */ true, /* cmdtrans= */ false, /* cmdstop= */ true,
+            ) {
+                abort_sdmmc1_write(regs);
+                return Err(err);
+            }
+            clear_sdmmc1_flags(regs);
+        }
+
+        wait_card_ready_yield(regs, card.rca).await
+    }
 }
 
 impl AsyncBlock512 for SdStorageIo<'_, '_, '_> {
@@ -440,11 +675,7 @@ impl AsyncBlock512 for SdStorageIo<'_, '_, '_> {
             for (dst, src) in self.dma_buf[..n].iter_mut().zip(chunk.iter()) {
                 dst.copy_from_slice(src);
             }
-            if n == 1 {
-                self.storage.write_block(lba, &self.dma_buf[0]).await?;
-            } else {
-                self.storage.write_blocks(lba, &self.dma_buf[..n]).await?;
-            }
+            self.write_chunk_nonblocking(lba, n).await?;
             lba = lba.saturating_add(n as u32);
             if self.yield_every_batch {
                 // Keeps USB CDC and 1 kHz tasks responsive during ~1,800-batch 64 GB FAT clears.

@@ -224,49 +224,59 @@ impl KnockDetector {
                 self.per_cyl_retard_deg_x10[cyl].min(clean.max_retard_deg_x10);
         }
     }
+}
 
+/// Pure function computing whether a knock combustion capture window starts inside the upcoming
+/// `30.0°` `CKP` tooth window, decoupled from `KnockDetector` mutable state for ISR use.
+pub fn plan_knock_window_on_ckp_tooth(
+    cfg: &KnockConfig,
+    ev: &CkpToothEvent,
+) -> Option<KnockWindowPlan> {
+    if !cfg.enabled
+        || ev.sync_state != SyncState::FullSynced720
+        || ev.rpm < cfg.min_rpm
+        || ev.tooth_period_us == 0
+    {
+        return None;
+    }
+
+    for &cyl in &HONDA_FIRING_ORDER {
+        let win_start_abs_x10 =
+            (CYLINDER_TDC_DEG_X10[cyl.index()] + cfg.window_start_deg_x10) % 7200;
+        if let Some(delta_x10) =
+            angle_offset_in_tooth_window(ev.crank_angle_deg_x10, win_start_abs_x10)
+        {
+            let delay_from_tooth_us = angle_delta_to_delay_us(delta_x10, ev.tooth_period_us);
+            let span_x10 = cfg
+                .window_end_deg_x10
+                .saturating_sub(cfg.window_start_deg_x10)
+                .max(50);
+            let duration_us = ((span_x10 as u64 * ev.tooth_period_us as u64)
+                / (DEG_X10_PER_CKP_TOOTH as u64))
+                .clamp(100, 10_000) as u32;
+            let sample_count = ((duration_us as u64 * KNOCK_SAMPLE_RATE_HZ as u64) / 1_000_000)
+                .clamp(
+                    MIN_KNOCK_WINDOW_SAMPLES as u64,
+                    MAX_KNOCK_WINDOW_SAMPLES as u64,
+                ) as u16;
+            return Some(KnockWindowPlan {
+                cylinder: cyl,
+                tooth_timestamp_us: ev.timestamp_us,
+                delay_from_tooth_us,
+                duration_us,
+                sample_count,
+                rpm: ev.rpm,
+            });
+        }
+    }
+    None
+}
+
+impl KnockDetector {
     /// Schedules a combustion knock window when its start angle falls inside the next `30.0°`
     /// `CKP` tooth segment.
     pub fn plan_on_ckp_tooth(&self, ev: &CkpToothEvent) -> Option<KnockWindowPlan> {
-        if !self.config.enabled
-            || ev.sync_state != SyncState::FullSynced720
-            || ev.rpm < self.config.min_rpm
-            || ev.tooth_period_us == 0
-        {
-            return None;
-        }
-
-        for &cyl in &HONDA_FIRING_ORDER {
-            let win_start_abs_x10 =
-                (CYLINDER_TDC_DEG_X10[cyl.index()] + self.config.window_start_deg_x10) % 7200;
-            if let Some(delta_x10) =
-                angle_offset_in_tooth_window(ev.crank_angle_deg_x10, win_start_abs_x10)
-            {
-                let delay_from_tooth_us = angle_delta_to_delay_us(delta_x10, ev.tooth_period_us);
-                let span_x10 = self
-                    .config
-                    .window_end_deg_x10
-                    .saturating_sub(self.config.window_start_deg_x10)
-                    .max(50);
-                let duration_us = ((span_x10 as u64 * ev.tooth_period_us as u64)
-                    / (DEG_X10_PER_CKP_TOOTH as u64))
-                    .clamp(100, 10_000) as u32;
-                let sample_count = ((duration_us as u64 * KNOCK_SAMPLE_RATE_HZ as u64) / 1_000_000)
-                    .clamp(
-                        MIN_KNOCK_WINDOW_SAMPLES as u64,
-                        MAX_KNOCK_WINDOW_SAMPLES as u64,
-                    ) as u16;
-                return Some(KnockWindowPlan {
-                    cylinder: cyl,
-                    tooth_timestamp_us: ev.timestamp_us,
-                    delay_from_tooth_us,
-                    duration_us,
-                    sample_count,
-                    rpm: ev.rpm,
-                });
-            }
-        }
-        None
+        plan_knock_window_on_ckp_tooth(&self.config, ev)
     }
 
     /// Evaluates one completed combustion window buffer for cylinder `cyl` at engine speed `rpm`.

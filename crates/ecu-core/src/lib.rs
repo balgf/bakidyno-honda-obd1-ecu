@@ -20,4 +20,4 @@ pub mod trigger;
 pub mod vtec;
 pub mod wideband;
 
-pub use engine::EngineCoordinator;
+pub use engine::{EngineCoordinator, RtControlTargets, RtTriggerEngine, RtTriggerStatus};

@@ -1,8 +1,8 @@
 //! Top-level ECU coordinator orchestrating `1 kHz` control ticks and hard real-time tooth edges.
 
-use crate::fuel::{FuelModel, InjScheduleBatch};
-use crate::ignition::{IgnitionModel, ToothScheduleBatch};
-use crate::knock::KnockDetector;
+use crate::fuel::{FuelModel, FuelToothScheduler, InjScheduleBatch};
+use crate::ignition::{IgnitionModel, IgnitionToothScheduler, ToothScheduleBatch};
+use crate::knock::{KnockDetector, KnockWindowPlan, plan_knock_window_on_ckp_tooth};
 use crate::math::interp_1d_i16_u16;
 use crate::sensors::SensorProcessor;
 use crate::trigger::{CkpToothEvent, HondaObd1Decoder};
@@ -19,6 +19,157 @@ pub struct ToothScheduleOutputs {
     pub event: Option<CkpToothEvent>,
     pub cop: ToothScheduleBatch,
     pub inj: InjScheduleBatch,
+}
+
+/// Control-loop outputs pushed from `1 kHz` `EngineCoordinator` into the `TIM2` ISR domain.
+#[derive(Debug, Clone, Copy)]
+pub struct RtControlTargets {
+    pub cal_ready: bool,
+    pub trigger_offset_deg_x10: i16,
+    pub spark_advance_deg_x10: i16,
+    pub cop_dwell_us: u32,
+    pub per_cyl_knock_retard_deg_x10: [i16; 4],
+    pub inj_pw_us: [u32; 4],
+    pub knock_config: KnockConfig,
+}
+
+impl Default for RtControlTargets {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl RtControlTargets {
+    pub const fn new() -> Self {
+        Self {
+            cal_ready: false,
+            trigger_offset_deg_x10: 0,
+            spark_advance_deg_x10: 160,
+            cop_dwell_us: 3_000,
+            per_cyl_knock_retard_deg_x10: [0; 4],
+            inj_pw_us: [0; 4],
+            knock_config: KnockConfig::default_honda_obd1(),
+        }
+    }
+}
+
+/// Real-time trigger snapshot pulled atomically from the `TIM2` ISR domain on each `1 kHz` tick.
+#[derive(Debug, Clone, Copy)]
+pub struct RtTriggerStatus {
+    pub trigger: HondaObd1Decoder,
+    pub last_angle_deg_x10: u16,
+    pub trigger_faults: FaultFlags,
+}
+
+/// Interrupt-domain real-time trigger & compare scheduler (`TIM2` ISR -> `TIM1`/`TIM3`/`TIM7`).
+///
+/// Decoupled cleanly from slow `1 kHz` table lookups, `USB`, `knock DSP`, and `SDMMC` logging so
+/// no Thread-Mode execution or `ECU_STATE` lock can drop a `CKP` edge or delay spark/fuel compare
+/// arming.
+pub struct RtTriggerEngine {
+    trigger: HondaObd1Decoder,
+    ignition_tooth: IgnitionToothScheduler,
+    fuel_tooth: FuelToothScheduler,
+    last_angle_deg_x10: u16,
+    trigger_faults: FaultFlags,
+    targets: RtControlTargets,
+}
+
+impl Default for RtTriggerEngine {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl RtTriggerEngine {
+    pub const fn new() -> Self {
+        Self {
+            trigger: HondaObd1Decoder::new(),
+            ignition_tooth: IgnitionToothScheduler::new(),
+            fuel_tooth: FuelToothScheduler::new(),
+            last_angle_deg_x10: 0,
+            trigger_faults: FaultFlags(0),
+            targets: RtControlTargets::new(),
+        }
+    }
+
+    #[inline]
+    pub fn is_full_synced(&self) -> bool {
+        self.trigger.sync_state() == SyncState::FullSynced720
+    }
+
+    #[inline]
+    pub fn on_cyp_capture(&mut self, timestamp_us: u32) {
+        self.trigger
+            .on_cyp_capture(timestamp_us, &mut self.trigger_faults);
+    }
+
+    #[inline]
+    pub fn on_tdc_capture(&mut self, timestamp_us: u32) {
+        self.trigger
+            .on_tdc_capture(timestamp_us, &mut self.trigger_faults);
+    }
+
+    #[inline]
+    pub fn on_ckp_capture(
+        &mut self,
+        timestamp_us: u32,
+    ) -> (ToothScheduleOutputs, Option<KnockWindowPlan>) {
+        if !self.targets.cal_ready {
+            return (ToothScheduleOutputs::default(), None);
+        }
+        if let Some(ev) = self.trigger.on_ckp_capture(
+            timestamp_us,
+            self.targets.trigger_offset_deg_x10,
+            &mut self.trigger_faults,
+        ) {
+            self.last_angle_deg_x10 = ev.crank_angle_deg_x10;
+            let cop = self.ignition_tooth.schedule_on_ckp_tooth(
+                &ev,
+                self.targets.spark_advance_deg_x10,
+                &self.targets.per_cyl_knock_retard_deg_x10,
+                self.targets.cop_dwell_us,
+            );
+            let inj = self
+                .fuel_tooth
+                .schedule_on_ckp_tooth(&ev, &self.targets.inj_pw_us);
+            let knock = plan_knock_window_on_ckp_tooth(&self.targets.knock_config, &ev);
+            (
+                ToothScheduleOutputs {
+                    event: Some(ev),
+                    cop,
+                    inj,
+                },
+                knock,
+            )
+        } else {
+            self.ignition_tooth.reset_cycle();
+            self.fuel_tooth.reset_cycle();
+            (ToothScheduleOutputs::default(), None)
+        }
+    }
+
+    /// Runs the `400 ms` stall watchdog and returns an atomic trigger status snapshot for `1 kHz`.
+    #[inline]
+    pub fn sync_1khz(&mut self, now_us: u32) -> RtTriggerStatus {
+        self.trigger.check_stall_timeout(now_us);
+        if self.trigger.sync_state() == SyncState::Unsynced {
+            self.ignition_tooth.reset_cycle();
+            self.fuel_tooth.reset_cycle();
+        }
+        let faults = self.trigger_faults;
+        self.trigger_faults = FaultFlags(0);
+        RtTriggerStatus {
+            trigger: self.trigger,
+            last_angle_deg_x10: self.last_angle_deg_x10,
+            trigger_faults: faults,
+        }
+    }
+
+    #[inline]
+    pub fn update_targets(&mut self, targets: RtControlTargets) {
+        self.targets = targets;
+    }
 }
 
 pub struct EngineCoordinator {
@@ -38,6 +189,7 @@ pub struct EngineCoordinator {
 
     latest_sensors: SensorSnapshot,
     latest_actuators: ActuatorOutputs,
+    last_computed_inj_pw_us: [u32; 4],
     latest_faults: FaultFlags,
     latest_ve_pct: f32,
     latest_target_lambda: f32,
@@ -97,6 +249,7 @@ impl EngineCoordinator {
                 lsu_heater_duty_per_mille: 0,
                 lsu_ip_dac_code: 2048,
             },
+            last_computed_inj_pw_us: [0; 4],
             latest_faults: FaultFlags(0),
             latest_ve_pct: 0.0,
             latest_target_lambda: 1.0,
@@ -168,8 +321,35 @@ impl EngineCoordinator {
                 inj,
             }
         } else {
+            self.ignition.reset_cycle();
             self.fuel.reset_cycle();
             ToothScheduleOutputs::default()
+        }
+    }
+
+    /// Synchronizes slow `1 kHz` control state with the latest interrupt-domain `TIM2` trigger snapshot.
+    #[inline]
+    pub fn apply_rt_status(&mut self, rt: RtTriggerStatus) {
+        self.trigger = rt.trigger;
+        self.last_angle_deg_x10 = rt.last_angle_deg_x10;
+        self.latest_faults.insert(rt.trigger_faults.0);
+        if self.trigger.sync_state() == SyncState::Unsynced {
+            self.ignition.reset_cycle();
+            self.fuel.reset_cycle();
+        }
+    }
+
+    /// Exports the latest `1 kHz` schedule parameters into the `TIM2` ISR domain.
+    #[inline]
+    pub fn export_rt_targets(&self, cal: &CalibrationBlob) -> RtControlTargets {
+        RtControlTargets {
+            cal_ready: true,
+            trigger_offset_deg_x10: cal.trigger_offset_deg_x10,
+            spark_advance_deg_x10: self.latest_actuators.spark_advance_deg_x10,
+            cop_dwell_us: self.latest_actuators.cop_dwell_us,
+            per_cyl_knock_retard_deg_x10: self.ignition.per_cyl_knock_retard_deg_x10(),
+            inj_pw_us: self.last_computed_inj_pw_us,
+            knock_config: self.knock.config(),
         }
     }
 
@@ -187,6 +367,7 @@ impl EngineCoordinator {
         self.seq = self.seq.saturating_add(1);
         self.trigger.check_stall_timeout(now_us);
         if self.trigger.sync_state() == SyncState::Unsynced {
+            self.ignition.reset_cycle();
             self.fuel.reset_cycle();
         }
 
@@ -316,6 +497,7 @@ impl EngineCoordinator {
 
         self.latest_sensors = sensors;
         self.latest_actuators = actuators;
+        self.last_computed_inj_pw_us = fuel_out.final_pw_us;
         self.latest_ve_pct = fuel_out.ve_pct;
         self.latest_target_lambda = fuel_out.target_lambda;
         self.latest_stft_pct = fuel_out.stft_pct;
@@ -572,5 +754,64 @@ mod tests {
         assert_eq!(act.inj_pw_us, [0; 4]);
         assert!(!act.fuel_pump_relay_on);
         assert!(!act.ac_clutch_relay_on);
+    }
+
+    #[test]
+    fn rt_trigger_engine_and_1khz_coordinator_split_stays_coherent() {
+        use super::RtTriggerEngine;
+
+        let cal = CalibrationBlob::default_honda_obd1();
+        let mut ecu = EngineCoordinator::new();
+        let mut rt = RtTriggerEngine::new();
+        let cruise_adc = nominal_raw_adc(0.42, 1.26);
+        let dt_us: u32 = 1_667; // ~3,000 RPM
+        let mut ts_us: u32 = 10_000;
+
+        rt.update_targets(ecu.export_rt_targets(&cal));
+        let _ = rt.on_ckp_capture(ts_us);
+
+        let mut cycle1_sparks = [0u8; 4];
+        let mut cycle1_inj = [0u8; 4];
+        for cycle in 0..2u8 {
+            for tooth in 0..24u8 {
+                if tooth == 0 {
+                    rt.on_cyp_capture(ts_us + 40);
+                }
+                if tooth.is_multiple_of(6) {
+                    rt.on_tdc_capture(ts_us + 80);
+                }
+                ts_us += dt_us;
+                let (out, _knock) = rt.on_ckp_capture(ts_us);
+                if cycle == 1 {
+                    for act in out.cop.actions.iter().flatten() {
+                        if !act.drive_dwell_high {
+                            cycle1_sparks[act.cylinder.index()] += 1;
+                        }
+                    }
+                    for act in out.inj.actions.iter().flatten() {
+                        cycle1_inj[act.cylinder.index()] += 1;
+                    }
+                }
+                let st = rt.sync_1khz(ts_us);
+                ecu.apply_rt_status(st);
+                let _ = ecu.tick_1khz(
+                    ts_us,
+                    &cruise_adc,
+                    SwitchState::default(),
+                    50.0,
+                    false,
+                    &cal,
+                );
+                rt.update_targets(ecu.export_rt_targets(&cal));
+            }
+        }
+
+        let snap = ecu.snapshot();
+        assert_eq!(snap.sync_state, SyncState::FullSynced720);
+        assert_eq!(snap.rpm, 2_999);
+        assert_eq!(snap.sync_loss_count, 0);
+        assert!(snap.faults.is_empty());
+        assert_eq!(cycle1_sparks, [1; 4]);
+        assert_eq!(cycle1_inj, [1; 4]);
     }
 }

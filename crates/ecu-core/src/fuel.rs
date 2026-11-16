@@ -42,11 +42,91 @@ pub struct FuelOutput {
     pub final_pw_us: [u32; 4],
 }
 
+/// Stateful per-cycle tooth scheduler converting computed pulse widths (`µs`) into Start-of-Injection
+/// `TIM3` compare actions anchored to `DEFAULT_INJ_EOI_ATDC_DEG_X10`.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct FuelToothScheduler {
+    inj_scheduled_in_cycle: [bool; 4],
+}
+
+impl FuelToothScheduler {
+    pub const fn new() -> Self {
+        Self {
+            inj_scheduled_in_cycle: [false; 4],
+        }
+    }
+
+    #[inline]
+    pub fn reset_cycle(&mut self) {
+        self.inj_scheduled_in_cycle = [false; 4];
+    }
+
+    /// Computes exact injector-opening compare events inside the upcoming `30.0°` `CKP` segment.
+    pub fn schedule_on_ckp_tooth(
+        &mut self,
+        tooth: &CkpToothEvent,
+        inj_pw_us: &[u32; 4],
+    ) -> InjScheduleBatch {
+        let mut batch = InjScheduleBatch::default();
+        if tooth.sync_state != SyncState::FullSynced720 || tooth.rpm == 0 {
+            self.reset_cycle();
+            return batch;
+        }
+
+        let period_us = tooth.tooth_period_us.max(1) as u64;
+        for &cyl in &HONDA_FIRING_ORDER {
+            let idx = cyl.index();
+            let tdc_x10 = CYLINDER_TDC_DEG_X10[idx] as i32;
+            let eoi_x10 = tdc_x10 + DEFAULT_INJ_EOI_ATDC_DEG_X10;
+            let reset_x10 = (eoi_x10 + INJ_RESET_OFFSET_FROM_EOI_X10).rem_euclid(7200) as u16;
+
+            // Reset per-cycle latch 120° after EOI so dynamic PW shifts never double-fire.
+            if angle_offset_in_tooth_window(tooth.crank_angle_deg_x10, reset_x10).is_some() {
+                self.inj_scheduled_in_cycle[idx] = false;
+                continue;
+            }
+
+            let pw_us = inj_pw_us[idx];
+            if pw_us == 0 || self.inj_scheduled_in_cycle[idx] {
+                continue;
+            }
+
+            let pw_deg_x10 =
+                ((pw_us as u64 * DEG_X10_PER_CKP_TOOTH as u64) / period_us).clamp(1, 5_400) as i32;
+            let soi_x10 = (eoi_x10 - pw_deg_x10).rem_euclid(7200) as u16;
+
+            if let Some(delta_deg) =
+                angle_offset_in_tooth_window(tooth.crank_angle_deg_x10, soi_x10)
+            {
+                self.inj_scheduled_in_cycle[idx] = true;
+                batch.push(InjCompareAction {
+                    cylinder: cyl,
+                    delay_from_tooth_us: angle_delta_to_delay_us(delta_deg, tooth.tooth_period_us),
+                    pulse_width_us: pw_us,
+                });
+            } else {
+                let behind_x10 =
+                    (tooth.crank_angle_deg_x10 as i32 - soi_x10 as i32).rem_euclid(7200);
+                if (1..=300).contains(&behind_x10) {
+                    self.inj_scheduled_in_cycle[idx] = true;
+                    batch.push(InjCompareAction {
+                        cylinder: cyl,
+                        delay_from_tooth_us: 0,
+                        pulse_width_us: pw_us,
+                    });
+                }
+            }
+        }
+
+        batch
+    }
+}
+
 pub struct FuelModel {
     stft_pi: PidController,
     prev_tps_pct: f32,
     accel_enrich_us: f32,
-    inj_scheduled_in_cycle: [bool; 4],
+    tooth_scheduler: FuelToothScheduler,
 }
 
 impl Default for FuelModel {
@@ -62,13 +142,13 @@ impl FuelModel {
             stft_pi: PidController::new(12.0, 28.0, 0.0, -25.0, 25.0),
             prev_tps_pct: 0.0,
             accel_enrich_us: 0.0,
-            inj_scheduled_in_cycle: [false; 4],
+            tooth_scheduler: FuelToothScheduler::new(),
         }
     }
 
     #[inline]
     pub fn reset_cycle(&mut self) {
-        self.inj_scheduled_in_cycle = [false; 4];
+        self.tooth_scheduler.reset_cycle();
     }
 
     pub fn compute_1khz(
@@ -219,58 +299,7 @@ impl FuelModel {
         tooth: &CkpToothEvent,
         inj_pw_us: &[u32; 4],
     ) -> InjScheduleBatch {
-        let mut batch = InjScheduleBatch::default();
-        if tooth.sync_state != SyncState::FullSynced720 || tooth.rpm == 0 {
-            self.reset_cycle();
-            return batch;
-        }
-
-        let period_us = tooth.tooth_period_us.max(1) as u64;
-        for &cyl in &HONDA_FIRING_ORDER {
-            let idx = cyl.index();
-            let tdc_x10 = CYLINDER_TDC_DEG_X10[idx] as i32;
-            let eoi_x10 = tdc_x10 + DEFAULT_INJ_EOI_ATDC_DEG_X10;
-            let reset_x10 = (eoi_x10 + INJ_RESET_OFFSET_FROM_EOI_X10).rem_euclid(7200) as u16;
-
-            // Reset per-cycle latch 120° after EOI so dynamic PW shifts never double-fire.
-            if angle_offset_in_tooth_window(tooth.crank_angle_deg_x10, reset_x10).is_some() {
-                self.inj_scheduled_in_cycle[idx] = false;
-                continue;
-            }
-
-            let pw_us = inj_pw_us[idx];
-            if pw_us == 0 || self.inj_scheduled_in_cycle[idx] {
-                continue;
-            }
-
-            let pw_deg_x10 =
-                ((pw_us as u64 * DEG_X10_PER_CKP_TOOTH as u64) / period_us).clamp(1, 5_400) as i32;
-            let soi_x10 = (eoi_x10 - pw_deg_x10).rem_euclid(7200) as u16;
-
-            if let Some(delta_deg) =
-                angle_offset_in_tooth_window(tooth.crank_angle_deg_x10, soi_x10)
-            {
-                self.inj_scheduled_in_cycle[idx] = true;
-                batch.push(InjCompareAction {
-                    cylinder: cyl,
-                    delay_from_tooth_us: angle_delta_to_delay_us(delta_deg, tooth.tooth_period_us),
-                    pulse_width_us: pw_us,
-                });
-            } else {
-                let behind_x10 =
-                    (tooth.crank_angle_deg_x10 as i32 - soi_x10 as i32).rem_euclid(7200);
-                if (1..=300).contains(&behind_x10) {
-                    self.inj_scheduled_in_cycle[idx] = true;
-                    batch.push(InjCompareAction {
-                        cylinder: cyl,
-                        delay_from_tooth_us: 0,
-                        pulse_width_us: pw_us,
-                    });
-                }
-            }
-        }
-
-        batch
+        self.tooth_scheduler.schedule_on_ckp_tooth(tooth, inj_pw_us)
     }
 }
 

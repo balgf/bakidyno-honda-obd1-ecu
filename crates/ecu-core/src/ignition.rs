@@ -23,8 +23,134 @@ pub struct CopCompareAction {
 /// Up to 4 coil edges can fall inside a single `30.0°` tooth window at high RPM / dwell overlap.
 pub type ToothScheduleBatch = ToothBatch<CopCompareAction>;
 
+/// Cycle-latch reset point (`120.0°` ATDC), safely past latest spark and ~300° before earliest dwell.
+const IGN_RESET_OFFSET_FROM_TDC_X10: i32 = 1_200;
+
+/// Stateful per-cycle tooth scheduler for Smart COP dwell start and spark release (`TIM1`).
+///
+/// Tracks per-cylinder latches across each `720°` cam cycle so minor RPM/tooth-period jitter or
+/// advance updates across `30.0°` `CKP` boundaries never skip a dwell/spark event or double-fire.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct IgnitionToothScheduler {
+    dwell_scheduled_in_cycle: [bool; 4],
+    spark_scheduled_in_cycle: [bool; 4],
+}
+
+impl IgnitionToothScheduler {
+    pub const fn new() -> Self {
+        Self {
+            dwell_scheduled_in_cycle: [false; 4],
+            spark_scheduled_in_cycle: [false; 4],
+        }
+    }
+
+    #[inline]
+    pub fn reset_cycle(&mut self) {
+        self.dwell_scheduled_in_cycle = [false; 4];
+        self.spark_scheduled_in_cycle = [false; 4];
+    }
+
+    /// Evaluates which Smart COP dwell-start (`HIGH`) and spark (`LOW`) compare events fall within
+    /// the next `30.0°` tooth segment (or just crossed behind the tooth edge by `<= 30.0°`).
+    pub fn schedule_on_ckp_tooth(
+        &mut self,
+        tooth: &CkpToothEvent,
+        spark_advance_deg_x10: i16,
+        per_cyl_knock_retard_deg_x10: &[i16; 4],
+        dwell_us: u32,
+    ) -> ToothScheduleBatch {
+        let mut batch = ToothScheduleBatch::default();
+        if tooth.sync_state != SyncState::FullSynced720 || tooth.rpm == 0 {
+            self.reset_cycle();
+            return batch;
+        }
+
+        // Convert `dwell_us` into `0.1°` crank degrees at current instantaneous tooth speed:
+        // `300` (`30.0°`) ticks take `tooth_period_us` µs =>
+        // `dwell_deg_x10 = dwell_us * 300 / tooth_period_us`
+        let period_us = tooth.tooth_period_us.max(1);
+        let dwell_deg_x10 = ((dwell_us as u64 * DEG_X10_PER_CKP_TOOTH as u64) / (period_us as u64))
+            .clamp(10, 2400) as i32;
+
+        for &cyl in &HONDA_FIRING_ORDER {
+            let idx = cyl.index();
+            let tdc_x10 = CYLINDER_TDC_DEG_X10[idx] as i32;
+            let reset_x10 = (tdc_x10 + IGN_RESET_OFFSET_FROM_TDC_X10).rem_euclid(7200) as u16;
+            if angle_offset_in_tooth_window(tooth.crank_angle_deg_x10, reset_x10).is_some() {
+                self.dwell_scheduled_in_cycle[idx] = false;
+                self.spark_scheduled_in_cycle[idx] = false;
+                continue;
+            }
+
+            let cyl_adv_x10 = (spark_advance_deg_x10 - per_cyl_knock_retard_deg_x10[idx]) as i32;
+            let spark_angle_x10 = (tdc_x10 - cyl_adv_x10).rem_euclid(7200) as u16;
+            let dwell_start_x10 = (spark_angle_x10 as i32 - dwell_deg_x10).rem_euclid(7200) as u16;
+
+            if !self.dwell_scheduled_in_cycle[idx] {
+                if let Some(d_deg) =
+                    angle_offset_in_tooth_window(tooth.crank_angle_deg_x10, dwell_start_x10)
+                {
+                    self.dwell_scheduled_in_cycle[idx] = true;
+                    batch.push(CopCompareAction {
+                        cylinder: cyl,
+                        delay_from_tooth_us: angle_delta_to_delay_us(d_deg, period_us),
+                        drive_dwell_high: true,
+                    });
+                } else {
+                    let dwell_behind_x10 = (tooth.crank_angle_deg_x10 as i32
+                        - dwell_start_x10 as i32)
+                        .rem_euclid(7200);
+                    let forward_to_spark_x10 = (spark_angle_x10 as i32
+                        - tooth.crank_angle_deg_x10 as i32)
+                        .rem_euclid(7200);
+                    // Only catch up a late dwell edge if spark is still strictly ahead in this
+                    // cycle so we never initiate a coil charge after spark angle already passed.
+                    if (1..=DEG_X10_PER_CKP_TOOTH as i32).contains(&dwell_behind_x10)
+                        && (1..=2400).contains(&forward_to_spark_x10)
+                    {
+                        self.dwell_scheduled_in_cycle[idx] = true;
+                        batch.push(CopCompareAction {
+                            cylinder: cyl,
+                            delay_from_tooth_us: 0,
+                            drive_dwell_high: true,
+                        });
+                    }
+                }
+            }
+
+            if !self.spark_scheduled_in_cycle[idx] {
+                if let Some(s_deg) =
+                    angle_offset_in_tooth_window(tooth.crank_angle_deg_x10, spark_angle_x10)
+                {
+                    self.spark_scheduled_in_cycle[idx] = true;
+                    batch.push(CopCompareAction {
+                        cylinder: cyl,
+                        delay_from_tooth_us: angle_delta_to_delay_us(s_deg, period_us),
+                        drive_dwell_high: false,
+                    });
+                } else if self.dwell_scheduled_in_cycle[idx] {
+                    let spark_behind_x10 = (tooth.crank_angle_deg_x10 as i32
+                        - spark_angle_x10 as i32)
+                        .rem_euclid(7200);
+                    if (1..=DEG_X10_PER_CKP_TOOTH as i32).contains(&spark_behind_x10) {
+                        self.spark_scheduled_in_cycle[idx] = true;
+                        batch.push(CopCompareAction {
+                            cylinder: cyl,
+                            delay_from_tooth_us: 0,
+                            drive_dwell_high: false,
+                        });
+                    }
+                }
+            }
+        }
+
+        batch
+    }
+}
+
 pub struct IgnitionModel {
     per_cyl_knock_retard_deg_x10: [i16; 4],
+    tooth_scheduler: IgnitionToothScheduler,
 }
 
 impl Default for IgnitionModel {
@@ -37,7 +163,13 @@ impl IgnitionModel {
     pub const fn new() -> Self {
         Self {
             per_cyl_knock_retard_deg_x10: [0; 4],
+            tooth_scheduler: IgnitionToothScheduler::new(),
         }
+    }
+
+    #[inline]
+    pub fn reset_cycle(&mut self) {
+        self.tooth_scheduler.reset_cycle();
     }
 
     #[inline]
@@ -105,59 +237,23 @@ impl IgnitionModel {
         (adv_x10.clamp(-50, 450), dwell_us)
     }
 
-    /// Angle-domain scheduler invoked on every `CKP` tooth edge (`TIM2` ISR, Priority 0 `ITCM`).
+    /// Angle-domain scheduler invoked on every `CKP` tooth edge (`TIM2` ISR).
     ///
     /// Arms 16-bit `TIM1` Output Compare channels **only within the final `< 30.0°` tooth window**,
-    /// guaranteeing `delay_from_tooth_us < 65_535` down to `150 RPM` while preserving `< 0.05°`
-    /// accuracy at `9,000 RPM`!
+    /// with per-cycle latches and boundary catch-up so minor tooth jitter or timing shifts across
+    /// a `30.0°` boundary never drop coil dwell or spark.
     pub fn schedule_on_ckp_tooth(
-        &self,
+        &mut self,
         tooth: &CkpToothEvent,
         spark_advance_deg_x10: i16,
         dwell_us: u32,
     ) -> ToothScheduleBatch {
-        let mut batch = ToothScheduleBatch::default();
-        if tooth.sync_state != SyncState::FullSynced720 || tooth.rpm == 0 {
-            return batch;
-        }
-
-        // Convert `dwell_us` into `0.1°` crank degrees at current instantaneous tooth speed:
-        // `300` (`30.0°`) ticks take `tooth_period_us` µs =>
-        // `dwell_deg_x10 = dwell_us * 300 / tooth_period_us`
-        let dwell_deg_x10 = ((dwell_us as u64 * DEG_X10_PER_CKP_TOOTH as u64)
-            / (tooth.tooth_period_us.max(1) as u64))
-            .clamp(10, 2400) as i32;
-
-        for &cyl in &HONDA_FIRING_ORDER {
-            let tdc_x10 = CYLINDER_TDC_DEG_X10[cyl.index()] as i32;
-            let cyl_adv_x10 =
-                (spark_advance_deg_x10 - self.per_cyl_knock_retard_deg_x10[cyl.index()]) as i32;
-
-            let spark_angle_x10 = (tdc_x10 - cyl_adv_x10).rem_euclid(7200) as u16;
-            let dwell_start_x10 = (spark_angle_x10 as i32 - dwell_deg_x10).rem_euclid(7200) as u16;
-
-            if let Some(d_deg) =
-                angle_offset_in_tooth_window(tooth.crank_angle_deg_x10, dwell_start_x10)
-            {
-                batch.push(CopCompareAction {
-                    cylinder: cyl,
-                    delay_from_tooth_us: angle_delta_to_delay_us(d_deg, tooth.tooth_period_us),
-                    drive_dwell_high: true,
-                });
-            }
-
-            if let Some(s_deg) =
-                angle_offset_in_tooth_window(tooth.crank_angle_deg_x10, spark_angle_x10)
-            {
-                batch.push(CopCompareAction {
-                    cylinder: cyl,
-                    delay_from_tooth_us: angle_delta_to_delay_us(s_deg, tooth.tooth_period_us),
-                    drive_dwell_high: false,
-                });
-            }
-        }
-
-        batch
+        self.tooth_scheduler.schedule_on_ckp_tooth(
+            tooth,
+            spark_advance_deg_x10,
+            &self.per_cyl_knock_retard_deg_x10,
+            dwell_us,
+        )
     }
 }
 
@@ -171,7 +267,7 @@ mod tests {
 
     #[test]
     fn schedules_all_four_cops_in_exact_1_3_4_2_sequence_over_720_deg() {
-        let ign = IgnitionModel::new();
+        let mut ign = IgnitionModel::new();
         let mut spark_order = [Cylinder::Cyl1; 4];
         let mut spark_count = 0usize;
         let mut dwell_count = 0usize;
@@ -273,5 +369,92 @@ mod tests {
         };
         let (hot_adv, _) = ign.compute_1khz(3_500, false, &hot_sns, None, &cal);
         assert_eq!(hot_adv, base_adv - 60);
+    }
+
+    #[test]
+    fn boundary_crossing_advance_and_jitter_never_drop_or_double_fire_dwell_or_spark() {
+        let mut ign = IgnitionModel::new();
+        let mut dwell_events = [0u8; 4];
+        let mut spark_events = [0u8; 4];
+
+        // Simulate aggressive timing step right across a 30.0° tooth boundary (`690.0°` Cyl1):
+        // Teeth 0..22 run at `29.0° BTDC` (`spark = 691.0°`, past `660..690`), then at tooth 23
+        // (`690.0°`) advance steps to `31.0° BTDC` (`spark = 689.0°`, behind `690.0°`) AND
+        // tooth_period_us tightens from 2,500 -> 2,300 µs (shifting `dwell_start` backward too!).
+        for tooth_idx in 0..24u8 {
+            let (adv, period_us, rpm) = if tooth_idx >= 23 {
+                (310, 2_300, 2_173)
+            } else {
+                (290, 2_500, 2_000)
+            };
+            let ev = CkpToothEvent {
+                sync_state: SyncState::FullSynced720,
+                tooth_index: tooth_idx,
+                crank_angle_deg_x10: tooth_idx as u16 * 300,
+                tooth_period_us: period_us,
+                rpm,
+                timestamp_us: tooth_idx as u32 * 2_500,
+            };
+            let batch = ign.schedule_on_ckp_tooth(&ev, adv, 2_800);
+            for act in batch.actions.iter().flatten() {
+                if act.drive_dwell_high {
+                    dwell_events[act.cylinder.index()] += 1;
+                } else {
+                    spark_events[act.cylinder.index()] += 1;
+                }
+            }
+        }
+        assert_eq!(dwell_events, [1; 4], "Every cylinder must dwell once");
+        assert_eq!(spark_events, [1; 4], "Every cylinder must fire spark once");
+
+        // Second cycle: step advance BACKWARD (`31.0° -> 27.0°`) right after Cyl3 sparked at 149°,
+        // placing the recomputed spark (`153°`) inside tooth 5 (`150..180`). Latch must block a
+        // duplicate second spark in the same 720° cycle!
+        let mut cycle2_sparks = [0u8; 4];
+        for tooth_idx in 0..24u8 {
+            let adv = if tooth_idx >= 5 { 270 } else { 310 };
+            let ev = CkpToothEvent {
+                sync_state: SyncState::FullSynced720,
+                tooth_index: tooth_idx,
+                crank_angle_deg_x10: tooth_idx as u16 * 300,
+                tooth_period_us: 2_500,
+                rpm: 2_000,
+                timestamp_us: 60_000 + tooth_idx as u32 * 2_500,
+            };
+            let batch = ign.schedule_on_ckp_tooth(&ev, adv, 2_800);
+            for act in batch.actions.iter().flatten() {
+                if !act.drive_dwell_high {
+                    cycle2_sparks[act.cylinder.index()] += 1;
+                }
+            }
+        }
+        assert_eq!(
+            cycle2_sparks, [1; 4],
+            "Cycle latch must prevent double-firing when advance decreases across a tooth edge"
+        );
+    }
+
+    #[test]
+    fn catchup_never_initiates_dwell_after_spark_angle_already_passed() {
+        let mut ign = IgnitionModel::new();
+        // Sync first appears at tooth 0 (`0.0°`), which for Cyl1 (`TDC = 0.0°`, `20.0° BTDC`) is
+        // AFTER Cyl1 spark (`700.0°`) and AFTER Cyl1 dwell start (`664.0°`). Must NOT dwell late!
+        let ev = CkpToothEvent {
+            sync_state: SyncState::FullSynced720,
+            tooth_index: 0,
+            crank_angle_deg_x10: 0,
+            tooth_period_us: 2_500,
+            rpm: 2_000,
+            timestamp_us: 1_000,
+        };
+        let batch = ign.schedule_on_ckp_tooth(&ev, 200, 3_000);
+        assert!(
+            batch
+                .actions
+                .iter()
+                .flatten()
+                .all(|a| a.cylinder != Cylinder::Cyl1),
+            "Cyl1 must not start dwell retroactively after passing spark angle"
+        );
     }
 }

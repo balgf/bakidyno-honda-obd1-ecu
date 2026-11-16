@@ -79,7 +79,7 @@ pub struct CkpToothEvent {
 }
 
 /// Deterministic `no_std` state machine decoding Honda's 3-sensor distributor (`24/4/1`).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy)]
 pub struct HondaObd1Decoder {
     sync_state: SyncState,
     tooth_index: u8,
