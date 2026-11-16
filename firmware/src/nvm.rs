@@ -1,12 +1,15 @@
-//! Non-volatile calibration storage on onboard `SPI1` JEDEC NOR Flash
+//! Non-volatile calibration & runtime configuration storage on onboard `SPI1` JEDEC NOR Flash
 //! (`Puya PY25Q64HA` / `Winbond W25Q64`, 8 MiB, 4 KB erase sectors).
 //!
-//! Uses ping-pong dual sectors (`0x00_0000` and `0x00_1000`) with monotonic generation sequence
-//! numbers and `CRC32` verification so sudden power loss during flash erase/program never
-//! corrupts the previously committed tune.
+//! Uses dual-sector ping-pong regions with monotonic generation sequence numbers, `CRC32`, and
+//! read-back verification so sudden power loss during erase/program never corrupts the active slot:
+//! - Calibration (`2,816 B` `CalibrationBlob`): `0x00_0000` & `0x00_1000`
+//! - Runtime Config (`KnockConfig` + `AuxIoConfig`): `0x00_2000` & `0x00_3000`
 
 use defmt::{info, warn};
-use ecu_types::{CalibrationBlob, crc32};
+use ecu_types::{
+    CalibrationBlob, RUNTIME_CONFIG_MAGIC, RUNTIME_CONFIG_VERSION, RuntimeConfigBlob, crc32,
+};
 use embassy_stm32::Peri;
 use embassy_stm32::gpio::{Level, Output, Pull, Speed};
 use embassy_stm32::mode::Blocking;
@@ -15,6 +18,7 @@ use embassy_stm32::spi::mode::Master;
 use embassy_stm32::spi::{Config as SpiConfig, Error as SpiError, MODE_0, Spi};
 use embassy_stm32::time::Hertz;
 use embassy_time::Timer;
+use proto_native::{MAX_RUNTIME_CONFIG_BYTES, decode_runtime_config, encode_runtime_config};
 use proto_tunerstudio::{TS_PAGE_SIZE, pack_page, unpack_page_into};
 
 const CMD_WRITE_STATUS_DISABLE_NA: u8 = 0x04;
@@ -29,10 +33,11 @@ const CMD_RELEASE_POWERDOWN: u8 = 0xab;
 const STATUS_BUSY_MASK: u8 = 0x01;
 const STATUS_WEL_MASK: u8 = 0x02;
 
-const NVM_MAGIC: u32 = 0x4349_564e;
-const NVM_SCHEMA_VERSION: u16 = 1;
+const CAL_NVM_MAGIC: u32 = 0x4349_564e;
+const CAL_SCHEMA_VERSION: u16 = 1;
 const HEADER_SIZE: usize = 16;
-const SLOT_SECTOR_ADDRS: [u32; 2] = [0x00_0000, 0x00_1000];
+const CAL_SECTOR_ADDRS: [u32; 2] = [0x00_0000, 0x00_1000];
+const CFG_SECTOR_ADDRS: [u32; 2] = [0x00_2000, 0x00_3000];
 const FLASH_PAGE_SIZE: usize = 256;
 const WRITE_CHUNK_SIZE: usize = 128;
 
@@ -47,6 +52,7 @@ pub enum NvmError {
 
 #[derive(Debug, Clone, Copy)]
 struct SlotHeader {
+    magic: u32,
     schema_version: u16,
     payload_len: u16,
     seq_gen: u32,
@@ -54,12 +60,13 @@ struct SlotHeader {
 }
 
 impl SlotHeader {
-    fn from_bytes(buf: &[u8; HEADER_SIZE]) -> Option<Self> {
+    fn from_bytes(buf: &[u8; HEADER_SIZE], expected_magic: u32) -> Option<Self> {
         let magic = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]);
-        if magic != NVM_MAGIC {
+        if magic != expected_magic {
             return None;
         }
         Some(Self {
+            magic,
             schema_version: u16::from_le_bytes([buf[4], buf[5]]),
             payload_len: u16::from_le_bytes([buf[6], buf[7]]),
             seq_gen: u32::from_le_bytes([buf[8], buf[9], buf[10], buf[11]]),
@@ -69,7 +76,7 @@ impl SlotHeader {
 
     fn to_bytes(self) -> [u8; HEADER_SIZE] {
         let mut buf = [0u8; HEADER_SIZE];
-        buf[0..4].copy_from_slice(&NVM_MAGIC.to_le_bytes());
+        buf[0..4].copy_from_slice(&self.magic.to_le_bytes());
         buf[4..6].copy_from_slice(&self.schema_version.to_le_bytes());
         buf[6..8].copy_from_slice(&self.payload_len.to_le_bytes());
         buf[8..12].copy_from_slice(&self.seq_gen.to_le_bytes());
@@ -78,14 +85,41 @@ impl SlotHeader {
     }
 }
 
-/// Manages dual-sector ping-pong calibration persistence over `SPI1` NOR Flash.
+#[derive(Clone, Copy)]
+struct PingPongRegion {
+    sectors: [u32; 2],
+    magic: u32,
+    schema_version: u16,
+    active_slot: Option<usize>,
+    active_seq: u32,
+}
+
+impl PingPongRegion {
+    const fn new(sectors: [u32; 2], magic: u32, schema_version: u16) -> Self {
+        Self {
+            sectors,
+            magic,
+            schema_version,
+            active_slot: None,
+            active_seq: 0,
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum RegionId {
+    Calibration,
+    RuntimeConfig,
+}
+
+/// Manages dual-sector ping-pong calibration & runtime config persistence over `SPI1` NOR Flash.
 pub struct NvmFlash<'d> {
     spi: Spi<'d, Blocking, Master>,
     cs_n: Output<'d>,
     jedec_id: [u8; 3],
     detected: bool,
-    active_slot: Option<usize>,
-    active_seq: u32,
+    cal_region: PingPongRegion,
+    cfg_region: PingPongRegion,
 }
 
 impl<'d> NvmFlash<'d> {
@@ -111,8 +145,12 @@ impl<'d> NvmFlash<'d> {
             cs_n,
             jedec_id: [0; 3],
             detected: false,
-            active_slot: None,
-            active_seq: 0,
+            cal_region: PingPongRegion::new(CAL_SECTOR_ADDRS, CAL_NVM_MAGIC, CAL_SCHEMA_VERSION),
+            cfg_region: PingPongRegion::new(
+                CFG_SECTOR_ADDRS,
+                RUNTIME_CONFIG_MAGIC,
+                RUNTIME_CONFIG_VERSION,
+            ),
         };
 
         // Wake flash cleanly in case a brownout left it in Deep Power-Down mode.
@@ -140,116 +178,63 @@ impl<'d> NvmFlash<'d> {
 
     /// Loads the newest CRC-validated `CalibrationBlob` from Flash, or `Default` on blank chip.
     pub async fn load_calibration(&mut self, scratch: &mut [u8; TS_PAGE_SIZE]) -> CalibrationBlob {
-        if !self.detected {
-            return CalibrationBlob::default_honda_obd1();
-        }
-
-        let mut best: Option<(usize, u32)> = None;
-        for (slot_idx, &sector_addr) in SLOT_SECTOR_ADDRS.iter().enumerate() {
-            let mut hdr_bytes = [0u8; HEADER_SIZE];
-            if self
-                .read_chunked(sector_addr, &mut hdr_bytes)
-                .await
-                .is_err()
-            {
-                continue;
-            }
-            let Some(hdr) = SlotHeader::from_bytes(&hdr_bytes) else {
-                continue;
-            };
-            if hdr.schema_version != NVM_SCHEMA_VERSION || hdr.payload_len as usize != TS_PAGE_SIZE
-            {
-                continue;
-            }
-            if self
-                .read_chunked(sector_addr + HEADER_SIZE as u32, scratch)
-                .await
-                .is_err()
-            {
-                continue;
-            }
-            if crc32(scratch) != hdr.payload_crc32 {
-                warn!("NVM slot {} failed CRC32; ignoring", slot_idx);
-                continue;
-            }
-            if best.is_none_or(|(_, best_seq)| hdr.seq_gen > best_seq) {
-                best = Some((slot_idx, hdr.seq_gen));
+        if let Some((slot_idx, seq_gen, _)) = self
+            .load_best_slot(RegionId::Calibration, scratch, Some(TS_PAGE_SIZE))
+            .await
+        {
+            let mut cal = CalibrationBlob::default_honda_obd1();
+            unpack_page_into(scratch, &mut cal);
+            if cal.validate_header() {
+                self.cal_region.active_slot = Some(slot_idx);
+                self.cal_region.active_seq = seq_gen;
+                info!("NVM cal loaded slot {} (seq={}, crc=ok)", slot_idx, seq_gen);
+                return cal;
             }
         }
 
-        if let Some((slot_idx, seq_gen)) = best {
-            let addr = SLOT_SECTOR_ADDRS[slot_idx] + HEADER_SIZE as u32;
-            if self.read_chunked(addr, scratch).await.is_ok() {
-                let mut cal = CalibrationBlob::default_honda_obd1();
-                unpack_page_into(scratch, &mut cal);
-                if cal.validate_header() {
-                    self.active_slot = Some(slot_idx);
-                    self.active_seq = seq_gen;
-                    info!("NVM loaded slot {} (seq={}, crc=ok)", slot_idx, seq_gen);
-                    return cal;
-                }
-            }
-        }
-
-        info!("NVM blank or uninitialized; using default Honda OBD1 base map");
+        info!("NVM cal blank or uninitialized; using default Honda OBD1 base map");
         CalibrationBlob::default_honda_obd1()
     }
 
-    /// Erases and programs the alternate 4 KB Flash sector non-blockingly (`after_millis(2)`).
+    /// Erases and programs the alternate 4 KB Flash sector for `CalibrationBlob`.
     pub async fn save_calibration(
         &mut self,
         cal: &CalibrationBlob,
         scratch: &mut [u8; TS_PAGE_SIZE],
     ) -> Result<(), NvmError> {
-        if !self.detected {
-            return Err(NvmError::NotDetected);
-        }
-
-        let next_slot = match self.active_slot {
-            Some(0) => 1,
-            _ => 0,
-        };
-        let next_seq = self.active_seq.wrapping_add(1).max(1);
-        let sector_addr = SLOT_SECTOR_ADDRS[next_slot];
-
         pack_page(cal, scratch);
-        let payload_crc32 = crc32(scratch);
-        let hdr = SlotHeader {
-            schema_version: NVM_SCHEMA_VERSION,
-            payload_len: TS_PAGE_SIZE as u16,
-            seq_gen: next_seq,
-            payload_crc32,
-        }
-        .to_bytes();
+        self.save_region_payload(RegionId::Calibration, scratch)
+            .await
+    }
 
-        self.erase_sector_4k(sector_addr).await?;
-        self.program_range(sector_addr, &hdr).await?;
-        self.program_range(sector_addr + HEADER_SIZE as u32, scratch)
-            .await?;
-
-        // Read-back verification guarantees flash bits committed before swapping active slot.
-        let mut verify_buf = [0u8; WRITE_CHUNK_SIZE];
-        let mut offset = 0usize;
-        while offset < TS_PAGE_SIZE {
-            let chunk_len = WRITE_CHUNK_SIZE.min(TS_PAGE_SIZE - offset);
-            self.read_bytes(
-                sector_addr + HEADER_SIZE as u32 + offset as u32,
-                &mut verify_buf[..chunk_len],
-            )?;
-            if verify_buf[..chunk_len] != scratch[offset..offset + chunk_len] {
-                return Err(NvmError::VerifyFailed);
-            }
-            offset += chunk_len;
-            Timer::after_millis(1).await;
+    /// Loads the newest CRC-validated [`RuntimeConfigBlob`] (`KnockConfig` + `AuxIoConfig`), or
+    /// stock defaults on a blank chip.
+    pub async fn load_runtime_config(&mut self) -> RuntimeConfigBlob {
+        let mut buf = [0u8; MAX_RUNTIME_CONFIG_BYTES];
+        if let Some((slot_idx, seq_gen, len)) = self
+            .load_best_slot(RegionId::RuntimeConfig, &mut buf, None)
+            .await
+            && let Some(cfg) = decode_runtime_config(&buf[..len])
+        {
+            self.cfg_region.active_slot = Some(slot_idx);
+            self.cfg_region.active_seq = seq_gen;
+            info!(
+                "NVM runtime cfg loaded slot {} (seq={}, crc=ok)",
+                slot_idx, seq_gen
+            );
+            return cfg;
         }
 
-        self.active_slot = Some(next_slot);
-        self.active_seq = next_seq;
-        info!(
-            "NVM committed slot {} (seq={}, crc=0x{:08x})",
-            next_slot, next_seq, payload_crc32
-        );
-        Ok(())
+        info!("NVM runtime cfg blank; using default Knock & Aux I/O settings");
+        RuntimeConfigBlob::default_honda_obd1()
+    }
+
+    /// Persists [`RuntimeConfigBlob`] (`KnockConfig` + `AuxIoConfig`) into dedicated sectors.
+    pub async fn save_runtime_config(&mut self, cfg: &RuntimeConfigBlob) -> Result<(), NvmError> {
+        let mut buf = [0u8; MAX_RUNTIME_CONFIG_BYTES];
+        let len = encode_runtime_config(cfg, &mut buf).map_err(|_| NvmError::VerifyFailed)?;
+        self.save_region_payload(RegionId::RuntimeConfig, &buf[..len])
+            .await
     }
 
     pub fn jedec_id(&self) -> [u8; 3] {
@@ -258,6 +243,133 @@ impl<'d> NvmFlash<'d> {
 
     pub fn is_detected(&self) -> bool {
         self.detected
+    }
+
+    fn region(&self, id: RegionId) -> PingPongRegion {
+        match id {
+            RegionId::Calibration => self.cal_region,
+            RegionId::RuntimeConfig => self.cfg_region,
+        }
+    }
+
+    fn region_mut(&mut self, id: RegionId) -> &mut PingPongRegion {
+        match id {
+            RegionId::Calibration => &mut self.cal_region,
+            RegionId::RuntimeConfig => &mut self.cfg_region,
+        }
+    }
+
+    async fn load_best_slot(
+        &mut self,
+        id: RegionId,
+        scratch: &mut [u8],
+        exact_len: Option<usize>,
+    ) -> Option<(usize, u32, usize)> {
+        if !self.detected {
+            return None;
+        }
+
+        let region = self.region(id);
+        let mut best: Option<(usize, u32, usize)> = None;
+        for (slot_idx, &sector_addr) in region.sectors.iter().enumerate() {
+            let mut hdr_bytes = [0u8; HEADER_SIZE];
+            if self
+                .read_chunked(sector_addr, &mut hdr_bytes)
+                .await
+                .is_err()
+            {
+                continue;
+            }
+            let Some(hdr) = SlotHeader::from_bytes(&hdr_bytes, region.magic) else {
+                continue;
+            };
+            let len = hdr.payload_len as usize;
+            let len_ok = match exact_len {
+                Some(req) => len == req,
+                None => len > 0 && len <= scratch.len(),
+            };
+            if hdr.schema_version != region.schema_version || !len_ok {
+                continue;
+            }
+            if self
+                .read_chunked(sector_addr + HEADER_SIZE as u32, &mut scratch[..len])
+                .await
+                .is_err()
+            {
+                continue;
+            }
+            if crc32(&scratch[..len]) != hdr.payload_crc32 {
+                warn!("NVM slot {} failed CRC32; ignoring", slot_idx);
+                continue;
+            }
+            if best.is_none_or(|(_, best_seq, _)| hdr.seq_gen > best_seq) {
+                best = Some((slot_idx, hdr.seq_gen, len));
+            }
+        }
+
+        // Re-populate `scratch` with the highest-sequence slot in case slot 0 won then slot 1 had
+        // stale bytes read into `scratch` (even if CRC failed).
+        if let Some((slot_idx, _, len)) = best {
+            let addr = region.sectors[slot_idx] + HEADER_SIZE as u32;
+            self.read_chunked(addr, &mut scratch[..len]).await.ok()?;
+        }
+        best
+    }
+
+    async fn save_region_payload(&mut self, id: RegionId, payload: &[u8]) -> Result<(), NvmError> {
+        if !self.detected {
+            return Err(NvmError::NotDetected);
+        }
+
+        let region = self.region(id);
+        let next_slot = match region.active_slot {
+            Some(0) => 1,
+            _ => 0,
+        };
+        let next_seq = region.active_seq.wrapping_add(1).max(1);
+        let sector_addr = region.sectors[next_slot];
+
+        let payload_crc32 = crc32(payload);
+        let hdr = SlotHeader {
+            magic: region.magic,
+            schema_version: region.schema_version,
+            payload_len: payload.len() as u16,
+            seq_gen: next_seq,
+            payload_crc32,
+        }
+        .to_bytes();
+
+        self.erase_sector_4k(sector_addr).await?;
+        self.program_range(sector_addr, &hdr).await?;
+        self.program_range(sector_addr + HEADER_SIZE as u32, payload)
+            .await?;
+
+        let mut verify_buf = [0u8; WRITE_CHUNK_SIZE];
+        let mut offset = 0usize;
+        while offset < payload.len() {
+            let chunk_len = WRITE_CHUNK_SIZE.min(payload.len() - offset);
+            self.read_bytes(
+                sector_addr + HEADER_SIZE as u32 + offset as u32,
+                &mut verify_buf[..chunk_len],
+            )?;
+            if verify_buf[..chunk_len] != payload[offset..offset + chunk_len] {
+                return Err(NvmError::VerifyFailed);
+            }
+            offset += chunk_len;
+            Timer::after_millis(1).await;
+        }
+
+        let reg_mut = self.region_mut(id);
+        reg_mut.active_slot = Some(next_slot);
+        reg_mut.active_seq = next_seq;
+        info!(
+            "NVM committed slot {} (seq={}, len={}, crc=0x{:08x})",
+            next_slot,
+            next_seq,
+            payload.len(),
+            payload_crc32
+        );
+        Ok(())
     }
 
     fn with_cs<R>(

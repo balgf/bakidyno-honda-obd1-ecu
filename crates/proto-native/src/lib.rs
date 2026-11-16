@@ -3,7 +3,10 @@
 //! Native framed RPC protocol (`postcard` + `CRC32` + `COBS` `0x00` packet delimiter)
 //! shared by `firmware`, `ecu-cli`, and our future custom Rust `tuner-gui`.
 
-pub use ecu_types::{KnockConfig, KnockTelemetry};
+pub use ecu_types::{
+    AltfState, AuxIoConfig, AuxIoTelemetry, AuxOutputs, AuxSpareMode, FlexFuelState,
+    FlexSensorStatus, KnockConfig, KnockTelemetry, RuntimeConfigBlob,
+};
 use ecu_types::{TelemetrySnapshot, crc32};
 use heapless::Vec;
 use serde::{Deserialize, Serialize};
@@ -128,6 +131,14 @@ pub enum Request {
     },
     /// Clears latched RAM MIL fault flags while leaving sensor plausibility & lockouts active.
     ClearFaults,
+    /// Reads live Phase D.4 auxiliary I/O, Flex Fuel, and `ALTF*` configuration & telemetry.
+    GetAuxStatus,
+    /// Updates runtime Phase D.4 auxiliary I/O & frequency capture configuration in RAM.
+    SetAuxConfig {
+        config: AuxIoConfig,
+    },
+    /// Persists active RAM `KnockConfig` + `AuxIoConfig` into dedicated `SPI1` NVM slots.
+    CommitRuntimeConfigToNvm,
 }
 
 /// Live Knock Window DSP config & telemetry snapshot returned by [`Request::GetKnockStatus`].
@@ -136,6 +147,13 @@ pub enum Request {
 pub struct KnockStatusReport {
     pub config: KnockConfig,
     pub telemetry: KnockTelemetry,
+}
+
+/// Live Phase D.4 Auxiliary I/O, Flex Fuel & `ALTF*` report returned by [`Request::GetAuxStatus`].
+#[derive(Debug, Clone, Copy, PartialEq, Default, Serialize, Deserialize)]
+pub struct AuxStatusReport {
+    pub config: AuxIoConfig,
+    pub telemetry: AuxIoTelemetry,
 }
 
 /// ECU-to-Host RPC response (`no_std` stack-allocated; `Box` intentionally avoided).
@@ -166,6 +184,7 @@ pub enum Response {
         data: Vec<u8, MAX_CHUNK_BYTES>,
     },
     KnockStatus(KnockStatusReport),
+    AuxStatus(AuxStatusReport),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -292,18 +311,35 @@ pub fn decode_frame<T: for<'de> Deserialize<'de>>(frame: &[u8]) -> Result<T, Pro
     postcard::from_bytes(&raw[..payload_len]).map_err(|_| ProtoError::DeserializeFailed)
 }
 
+/// Maximum serialized size of [`RuntimeConfigBlob`] persisted in `SPI1` NVM (`<= 256 B`).
+pub const MAX_RUNTIME_CONFIG_BYTES: usize = 256;
+
+/// Serializes a [`RuntimeConfigBlob`] with `postcard` into `out`, returning written length.
+pub fn encode_runtime_config(cfg: &RuntimeConfigBlob, out: &mut [u8]) -> Result<usize, ProtoError> {
+    Ok(postcard::to_slice(cfg, out)
+        .map_err(|_| ProtoError::SerializeFailed)?
+        .len())
+}
+
+/// Deserializes and header-validates a persisted [`RuntimeConfigBlob`].
+pub fn decode_runtime_config(bytes: &[u8]) -> Option<RuntimeConfigBlob> {
+    let cfg: RuntimeConfigBlob = postcard::from_bytes(bytes).ok()?;
+    cfg.validate_header().then_some(cfg)
+}
+
 #[cfg(test)]
 mod tests {
     use ecu_types::{
-        ActuatorOutputs, FaultFlags, KnockConfig, KnockTelemetry, SensorSnapshot, SyncState,
-        TelemetrySnapshot, VtecState, WidebandState,
+        ActuatorOutputs, AuxIoConfig, AuxIoTelemetry, FaultFlags, KnockConfig, KnockTelemetry,
+        RuntimeConfigBlob, SensorSnapshot, SyncState, TelemetrySnapshot, VtecState, WidebandState,
     };
     use heapless::Vec;
 
     use super::{
-        KnockStatusReport, MAX_CHUNK_BYTES, MAX_FRAME_BYTES, ProtoError, Request, Response,
-        SD_FORMAT_CONFIRM_MAGIC, SdDirEntry, SdDiskKind, SdStatusReport, cobs_decode,
-        cobs_encode_with_delimiter, decode_frame, encode_frame,
+        AuxStatusReport, KnockStatusReport, MAX_CHUNK_BYTES, MAX_FRAME_BYTES,
+        MAX_RUNTIME_CONFIG_BYTES, ProtoError, Request, Response, SD_FORMAT_CONFIRM_MAGIC,
+        SdDirEntry, SdDiskKind, SdStatusReport, cobs_decode, cobs_encode_with_delimiter,
+        decode_frame, decode_runtime_config, encode_frame, encode_runtime_config,
     };
 
     #[test]
@@ -485,5 +521,32 @@ mod tests {
             decode_frame::<Request>(&wire[..clr_len]),
             Ok(Request::ClearFaults)
         );
+
+        let aux_req = Request::SetAuxConfig {
+            config: AuxIoConfig::default_honda_obd1(),
+        };
+        let alen = encode_frame(&aux_req, &mut wire).expect("encode SetAuxConfig");
+        assert_eq!(decode_frame::<Request>(&wire[..alen]), Ok(aux_req));
+
+        let burn_rt_len =
+            encode_frame(&Request::CommitRuntimeConfigToNvm, &mut wire).expect("encode Commit");
+        assert_eq!(
+            decode_frame::<Request>(&wire[..burn_rt_len]),
+            Ok(Request::CommitRuntimeConfigToNvm)
+        );
+
+        let aux_resp = Response::AuxStatus(AuxStatusReport {
+            config: AuxIoConfig::default_honda_obd1(),
+            telemetry: AuxIoTelemetry::default(),
+        });
+        let arlen = encode_frame(&aux_resp, &mut wire).expect("encode AuxStatus");
+        assert_eq!(decode_frame::<Response>(&wire[..arlen]), Ok(aux_resp));
+
+        let mut rt_buf = [0u8; MAX_RUNTIME_CONFIG_BYTES];
+        let mut rt_cfg = RuntimeConfigBlob::default_honda_obd1();
+        rt_cfg.knock.center_freq_hz = 7_800;
+        rt_cfg.aux.iab_engage_rpm = 5_900;
+        let rt_len = encode_runtime_config(&rt_cfg, &mut rt_buf).expect("encode RuntimeConfigBlob");
+        assert_eq!(decode_runtime_config(&rt_buf[..rt_len]), Some(rt_cfg));
     }
 }

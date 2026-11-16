@@ -532,6 +532,274 @@ pub struct KnockTelemetry {
     pub capture_overruns: u32,
 }
 
+/// Magic header identifying a valid persisted `RuntimeConfigBlob` (`"CIKA"`).
+pub const RUNTIME_CONFIG_MAGIC: u32 = 0x4349_4b41;
+/// Schema version for persisted [`RuntimeConfigBlob`].
+pub const RUNTIME_CONFIG_VERSION: u16 = 1;
+
+/// Operating mode for configurable spare low-side driver outputs (`PE0`, `PE1`).
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+pub enum AuxSpareMode {
+    /// Output always remains OFF (safe default when chassis pin assignment varies).
+    Disabled,
+    /// Activates above `engage_rpm` with hysteresis down to `disengage_rpm`.
+    ShiftLight { engage_rpm: u16, disengage_rpm: u16 },
+    /// Activates under wide-open throttle when `tps_pct >= min_tps_pct` and `rpm >= min_rpm`.
+    WotTrigger { min_tps_pct: f32, min_rpm: u16 },
+    /// Secondary coolant fan / radiator trigger at `on_c` with turn-off at `off_c`.
+    CoolantFanBackup { on_c: f32, off_c: f32 },
+    /// Over-temperature warning lamp/solenoid latching above `warn_c` until `< clear_c`.
+    OverTempWarning { warn_c: f32, clear_c: f32 },
+}
+
+/// Configuration parameters for Phase D.4 auxiliary outputs and frequency inputs.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+pub struct AuxIoConfig {
+    /// Enables Honda dual-mode `ALTC*` (`PD8`, `A16`) Eco/Charge alternator control.
+    pub altc_enabled: bool,
+    /// Battery voltage threshold above which `ALTC*` may drop to ~12.6V Eco setpoint.
+    pub altc_eco_vbatt_on_v: f32,
+    /// Battery voltage threshold below which `ALTC*` forces full ~14.4V charging.
+    pub altc_eco_vbatt_off_v: f32,
+    /// Maximum Electrical Load Detector current (`ELD`) eligible for Eco charging.
+    pub altc_max_eld_amps: f32,
+    /// `ELD` hysteresis release threshold forcing full charging above heavy electrical draw.
+    pub altc_eld_hyst_amps: f32,
+    /// Throttle threshold (`%`) above which alternator unloads in Eco mode for WOT power.
+    pub altc_wot_unload_tps_pct: f32,
+    /// Enables Honda P72 `IAB*` (`PD9`, `A17`) dual-runner butterfly control.
+    pub iab_enabled: bool,
+    /// Inverts `IAB*` output polarity for OEM normally-closed vacuum solenoid setups.
+    pub iab_invert: bool,
+    /// Engine speed threshold (`RPM`) where `IAB*` transitions above crossover.
+    pub iab_engage_rpm: u16,
+    /// Engine speed hysteresis release threshold (`RPM`) for `IAB*`.
+    pub iab_disengage_rpm: u16,
+    /// Enables closed-loop `EVAP*` (`PD10`, `A20`) canister purge modulation.
+    pub evap_enabled: bool,
+    /// Minimum coolant temperature (`°C`) required before canister purge begins.
+    pub evap_min_ect_c: f32,
+    /// Minimum engine speed (`RPM`) for off-idle EVAP purge.
+    pub evap_min_rpm: u16,
+    /// Stale timeout (`ms`) before `FLEX` sensor reverts to `NotDetected`.
+    pub flex_timeout_ms: u32,
+    /// Set `true` if Flex temperature pulse is active-low instead of active-high.
+    pub flex_active_low_pulse: bool,
+    /// Stale timeout (`ms`) before `ALTF*` alternator field capture marks invalid.
+    pub altf_timeout_ms: u32,
+    /// Set `true` if `ALTF*` duty encodes field load on the low half-cycle.
+    pub altf_active_low_duty: bool,
+    /// Behavior selector for `PE0` (`A11 EGR* / A18`).
+    pub pe0_mode: AuxSpareMode,
+    /// Behavior selector for `PE1` (`A19 VAR*`).
+    pub pe1_mode: AuxSpareMode,
+}
+
+impl Default for AuxIoConfig {
+    fn default() -> Self {
+        Self::default_honda_obd1()
+    }
+}
+
+impl AuxIoConfig {
+    /// Conservative Honda OBD1 bench & street baseline matching P28/P72 pin conventions.
+    pub const fn default_honda_obd1() -> Self {
+        Self {
+            altc_enabled: true,
+            altc_eco_vbatt_on_v: 13.8,
+            altc_eco_vbatt_off_v: 13.2,
+            altc_max_eld_amps: 15.0,
+            altc_eld_hyst_amps: 22.0,
+            altc_wot_unload_tps_pct: 75.0,
+            iab_enabled: true,
+            iab_invert: false,
+            iab_engage_rpm: 5_750,
+            iab_disengage_rpm: 5_500,
+            evap_enabled: true,
+            evap_min_ect_c: 65.0,
+            evap_min_rpm: 1_200,
+            flex_timeout_ms: 250,
+            flex_active_low_pulse: false,
+            altf_timeout_ms: 150,
+            altf_active_low_duty: false,
+            pe0_mode: AuxSpareMode::Disabled,
+            pe1_mode: AuxSpareMode::Disabled,
+        }
+    }
+}
+
+/// Detection status for the Continental `50–150 Hz` Flex Fuel sensor (`PE15`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+pub enum FlexSensorStatus {
+    /// No recent valid edges detected (sensor absent or unplugged).
+    NotDetected,
+    /// Active signal within nominal `45–155 Hz` Continental ethanol window.
+    Valid,
+    /// Edges observed outside valid `45–155 Hz` range (contamination / wiring fault).
+    OutOfRangeFault,
+}
+
+/// Decoded ethanol concentration, fuel temperature, and derived fuel/timing trims.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct FlexFuelState {
+    pub status: FlexSensorStatus,
+    pub freq_hz: f32,
+    pub ethanol_pct: f32,
+    pub fuel_temp_c: f32,
+    pub age_ms: u32,
+}
+
+impl Default for FlexFuelState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl FlexFuelState {
+    /// Safe gasoline-baseline state prior to receiving Flex Fuel edges.
+    pub const fn new() -> Self {
+        Self {
+            status: FlexSensorStatus::NotDetected,
+            freq_hz: 0.0,
+            ethanol_pct: 0.0,
+            fuel_temp_c: 20.0,
+            age_ms: 0,
+        }
+    }
+
+    /// Returns `true` when the Continental sensor is actively streaming valid pulses.
+    #[inline]
+    pub const fn is_valid(&self) -> bool {
+        matches!(self.status, FlexSensorStatus::Valid)
+    }
+
+    /// Blended stoichiometric Air-Fuel Ratio (`14.7` at `E0`, `9.0` at `E100`).
+    pub fn stoich_afr(&self) -> f32 {
+        let e = if self.is_valid() {
+            (self.ethanol_pct * 0.01).clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+        14.7 * (1.0 - e) + 9.0 * e
+    }
+
+    /// Volumetric injector flow multiplier relative to pump gasoline
+    /// (`1.000` at `E0`, `~1.412` at `E85`).
+    pub fn fuel_volume_multiplier(&self) -> f32 {
+        if !self.is_valid() {
+            return 1.0;
+        }
+        let e = (self.ethanol_pct * 0.01).clamp(0.0, 1.0);
+        let density_ratio = 1.0 + 0.0662 * e;
+        (14.7 / self.stoich_afr()) / density_ratio
+    }
+
+    /// Conservative octane timing trim (`0.0°` up to `E10`, ramping linearly to `+4.0°` at `E85+`).
+    pub fn spark_advance_offset_deg(&self) -> f32 {
+        if !self.is_valid() {
+            return 0.0;
+        }
+        ((self.ethanol_pct - 10.0) / 75.0).clamp(0.0, 1.0) * 4.0
+    }
+}
+
+/// Decoded `PB7` (`D9 ALTF*`) alternator field duty cycle state.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct AltfState {
+    pub valid: bool,
+    pub freq_hz: f32,
+    pub field_duty_pct: f32,
+    pub age_ms: u32,
+}
+
+impl Default for AltfState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl AltfState {
+    pub const fn new() -> Self {
+        Self {
+            valid: false,
+            freq_hz: 0.0,
+            field_duty_pct: 0.0,
+            age_ms: 0,
+        }
+    }
+}
+
+/// Commanded discrete gate states for Phase D.4 auxiliary low-side drivers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct AuxOutputs {
+    /// `PD8` (`A16 ALTC*`): `true` pulls `A16` low -> Eco/WOT unload (~12.6V), `false` -> ~14.5V.
+    pub altc_on: bool,
+    /// `PD9` (`A17 IAB*`): dual-runner intake manifold butterfly solenoid gate drive.
+    pub iab_on: bool,
+    /// `PD10` (`A20 EVAP*`): modulated purge valve gate state for the current `1 ms` tick.
+    pub evap_on: bool,
+    /// Commanded EVAP purge duty cycle (`0..=1000` per-mille at `10 Hz`).
+    pub evap_duty_per_mille: u16,
+    /// `PE0` (`A11 EGR* / A18`) low-side gate drive.
+    pub pe0_on: bool,
+    /// `PE1` (`A19 VAR*`) low-side gate drive.
+    pub pe1_on: bool,
+}
+
+impl AuxOutputs {
+    /// Packs the 5 discrete pin states into a compact `u8` bitmask (`bit0=ALTC..bit4=PE1`).
+    pub const fn bitmask(&self) -> u8 {
+        (self.altc_on as u8)
+            | ((self.iab_on as u8) << 1)
+            | ((self.evap_on as u8) << 2)
+            | ((self.pe0_on as u8) << 3)
+            | ((self.pe1_on as u8) << 4)
+    }
+}
+
+/// Combined auxiliary telemetry and output snapshot produced every `1 ms`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
+pub struct AuxIoTelemetry {
+    pub outputs: AuxOutputs,
+    pub flex: FlexFuelState,
+    pub altf: AltfState,
+}
+
+/// Non-volatile runtime feature settings (`KnockConfig` + `AuxIoConfig`) stored independently of
+/// the TunerStudio `2,816`-byte calibration page.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct RuntimeConfigBlob {
+    pub magic: u32,
+    pub version: u16,
+    pub knock: KnockConfig,
+    pub aux: AuxIoConfig,
+}
+
+impl Default for RuntimeConfigBlob {
+    fn default() -> Self {
+        Self::default_honda_obd1()
+    }
+}
+
+impl RuntimeConfigBlob {
+    pub const fn default_honda_obd1() -> Self {
+        Self {
+            magic: RUNTIME_CONFIG_MAGIC,
+            version: RUNTIME_CONFIG_VERSION,
+            knock: KnockConfig::default_honda_obd1(),
+            aux: AuxIoConfig::default_honda_obd1(),
+        }
+    }
+
+    #[inline]
+    pub const fn validate_header(&self) -> bool {
+        self.magic == RUNTIME_CONFIG_MAGIC && self.version == RUNTIME_CONFIG_VERSION
+    }
+}
+
 /// Computes IEEE 802.3 CRC-32 over an arbitrary byte slice.
 #[inline]
 pub fn crc32(bytes: &[u8]) -> u32 {

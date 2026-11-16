@@ -247,14 +247,19 @@ async fn main(spawner: Spawner) {
         Irqs,
     );
 
-    // 5. Load calibration from `SPI1` NOR Flash (or default map) & spawn trigger + USB CDC tasks
+    // 5. Load calibration & runtime configs from `SPI1` NOR Flash & spawn tasks
     let mut boot_page_buf = [0u8; TS_PAGE_SIZE];
     let cal = nvm.load_calibration(&mut boot_page_buf).await;
     defmt::assert!(cal.validate_header());
     proto_tunerstudio::pack_page(&cal, &mut boot_page_buf);
     sd_logger_hw::update_cal_crc(ecu_types::crc32(&boot_page_buf));
+    let rt_cfg = nvm.load_runtime_config().await;
+    let aux_cfg = ecu_core::aux_io::sanitize_aux_config(rt_cfg.aux);
     {
         let mut state = ECU_STATE.lock().await;
+        state.ecu.set_knock_config(rt_cfg.knock);
+        knock_hw::set_hw_enabled(state.ecu.knock_config().enabled);
+        state.aux_cfg = aux_cfg;
         let targets = state.ecu.export_rt_targets(&cal);
         state.cal = Some(cal);
         rt_trigger::update_targets(targets);

@@ -3,7 +3,8 @@
 //! and `proto-native` (`COBS` + `CRC32` + `postcard` RPC).
 
 use defmt::{info, warn};
-use ecu_types::CalibrationBlob;
+use ecu_core::aux_io::sanitize_aux_config;
+use ecu_types::{CalibrationBlob, RuntimeConfigBlob};
 use embassy_stm32::Peri;
 use embassy_stm32::interrupt::typelevel::Binding;
 use embassy_stm32::peripherals;
@@ -14,8 +15,8 @@ use embassy_usb::driver::EndpointError;
 use embassy_usb::{Builder, Config as UsbConfig, UsbDevice};
 use heapless::Vec;
 use proto_native::{
-    KnockStatusReport, MAX_CHUNK_BYTES, ProtoError, Request, Response, SD_FORMAT_CONFIRM_MAGIC,
-    decode_frame, encode_frame,
+    AuxStatusReport, KnockStatusReport, MAX_CHUNK_BYTES, ProtoError, Request, Response,
+    SD_FORMAT_CONFIRM_MAGIC, decode_frame, encode_frame,
 };
 use proto_tunerstudio::{
     TS_ERR_OUT_OF_RANGE, TS_FLAG_BURN_OK, TS_PAGE_SIZE, handle_ts_packet,
@@ -497,6 +498,39 @@ async fn dispatch_native_request(
         Request::ClearFaults => {
             ECU_STATE.lock().await.ecu.clear_faults();
             Response::Ack
+        }
+        Request::GetAuxStatus => {
+            let state = ECU_STATE.lock().await;
+            Response::AuxStatus(AuxStatusReport {
+                config: state.aux_cfg,
+                telemetry: state.aux_telemetry,
+            })
+        }
+        Request::SetAuxConfig { config } => {
+            let sanitized = sanitize_aux_config(config);
+            ECU_STATE.lock().await.aux_cfg = sanitized;
+            crate::aux_io_hw::set_capture_polarity(
+                sanitized.flex_active_low_pulse,
+                sanitized.altf_active_low_duty,
+            );
+            Response::Ack
+        }
+        Request::CommitRuntimeConfigToNvm => {
+            let rt_cfg = {
+                let state = ECU_STATE.lock().await;
+                RuntimeConfigBlob {
+                    knock: state.ecu.knock_config(),
+                    aux: state.aux_cfg,
+                    ..RuntimeConfigBlob::default_honda_obd1()
+                }
+            };
+            match nvm.save_runtime_config(&rt_cfg).await {
+                Ok(()) => Response::Ack,
+                Err(err) => {
+                    warn!("NVM runtime config write failed: {}", err);
+                    Response::Error(ProtoError::NvmWriteFailed)
+                }
+            }
         }
     }
 }

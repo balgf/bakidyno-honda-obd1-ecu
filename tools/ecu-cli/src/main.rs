@@ -14,8 +14,9 @@ use ecu_core::datalog::{
 use ecu_core::sensors::{ADC_FULL_SCALE, VREF_VOLTS};
 use ecu_types::{CalibrationBlob, FaultFlags, RawSensorAdc, SwitchState, crc32};
 use proto_native::{
-    KnockConfig, KnockStatusReport, MAX_CHUNK_BYTES, MAX_FRAME_BYTES, ProtoError, Request,
-    Response, SD_FORMAT_CONFIRM_MAGIC, SdDiskKind, SdStatusReport, decode_frame, encode_frame,
+    AuxStatusReport, KnockConfig, KnockStatusReport, MAX_CHUNK_BYTES, MAX_FRAME_BYTES, ProtoError,
+    Request, Response, SD_FORMAT_CONFIRM_MAGIC, SdDiskKind, SdStatusReport, decode_frame,
+    encode_frame,
 };
 use proto_tunerstudio::{
     TS_FLAG_BURN_OK, TS_FLAG_OK, TS_OCH_SIZE, TS_PAGE_SIZE, TS_PROTO_VERSION, TS_SIGNATURE,
@@ -118,6 +119,24 @@ enum Commands {
         step_deg_x10: Option<i16>,
         #[arg(long)]
         max_deg_x10: Option<i16>,
+        /// Also persist active Knock + Aux configs to SPI1 Flash NVM after updating RAM
+        #[arg(long)]
+        burn: bool,
+    },
+    /// Clear latched MIL fault flags in ECU RAM over `proto-native`
+    ClearFaults {
+        #[arg(long, default_value = "/dev/ttyACM0")]
+        port: String,
+    },
+    /// Query live Phase D.4 Auxiliary I/O, Flex Fuel, and `ALTF*` status
+    AuxStatus {
+        #[arg(long, default_value = "/dev/ttyACM0")]
+        port: String,
+    },
+    /// Persist active Knock DSP and Auxiliary I/O runtime configurations to SPI1 Flash NVM
+    BurnConfig {
+        #[arg(long, default_value = "/dev/ttyACM0")]
+        port: String,
     },
 }
 
@@ -1247,6 +1266,7 @@ fn run_knock_cfg(
     threshold_x100: Option<u16>,
     step_deg_x10: Option<i16>,
     max_deg_x10: Option<i16>,
+    burn: bool,
 ) -> Result<()> {
     let mut port = open_serial(port_path)?;
     let current = fetch_knock_status(&mut port)?;
@@ -1263,13 +1283,106 @@ fn run_knock_cfg(
     );
     match native_rpc(&mut port, &Request::SetKnockConfig { config: updated })? {
         Response::Ack => {
+            if burn {
+                commit_runtime_cfg(&mut port)?;
+            }
             let confirmed = fetch_knock_status(&mut port)?;
             print_knock_status(&confirmed);
+            if burn {
+                println!("Persisted Knock + Aux runtime config to SPI1 Flash NVM.");
+            }
             Ok(())
         }
         Response::Error(err) => bail!("SetKnockConfig failed: {err:?}"),
         other => bail!("unexpected SetKnockConfig response: {other:?}"),
     }
+}
+
+fn commit_runtime_cfg(port: &mut File) -> Result<()> {
+    match native_rpc_with_timeout(
+        port,
+        &Request::CommitRuntimeConfigToNvm,
+        Duration::from_secs(5),
+    )? {
+        Response::Ack => Ok(()),
+        Response::Error(err) => bail!("CommitRuntimeConfigToNvm failed: {err:?}"),
+        other => bail!("unexpected CommitRuntimeConfigToNvm response: {other:?}"),
+    }
+}
+
+fn run_clear_faults(port_path: &str) -> Result<()> {
+    let mut port = open_serial(port_path)?;
+    match native_rpc(&mut port, &Request::ClearFaults)? {
+        Response::Ack => {
+            println!("Cleared latched MIL fault codes in ECU RAM.");
+            Ok(())
+        }
+        Response::Error(err) => bail!("ClearFaults failed: {err:?}"),
+        other => bail!("unexpected ClearFaults response: {other:?}"),
+    }
+}
+
+fn print_aux_status(report: &AuxStatusReport) {
+    let out = &report.telemetry.outputs;
+    let flex = &report.telemetry.flex;
+    let altf = &report.telemetry.altf;
+    println!("Aux I/O & Flex Fuel Report");
+    println!("--------------------------");
+    println!(
+        "Outputs    : ALTC*={} IAB*={} EVAP*={} ({:.1}%) PE0={} PE1={}",
+        out.altc_on,
+        out.iab_on,
+        out.evap_on,
+        f32::from(out.evap_duty_per_mille) / 10.0,
+        out.pe0_on,
+        out.pe1_on
+    );
+    println!(
+        "Flex Fuel  : {:?} | {:.1} Hz | {:.1}% E | {:.1} C | {:.2} AFR | {:.3}x fuel | +{:.1} deg",
+        flex.status,
+        flex.freq_hz,
+        flex.ethanol_pct,
+        flex.fuel_temp_c,
+        flex.stoich_afr(),
+        flex.fuel_volume_multiplier(),
+        flex.spark_advance_offset_deg()
+    );
+    println!(
+        "ALTF Field : valid={} | {:.1} Hz | {:.1}% duty",
+        altf.valid, altf.freq_hz, altf.field_duty_pct
+    );
+    println!(
+        "Config     : ALTC={} (Eco {:.1}..{:.1}V) | IAB={} (inv={}, {}/{} RPM) | EVAP={} | PE0={:?} | PE1={:?}",
+        report.config.altc_enabled,
+        report.config.altc_eco_vbatt_off_v,
+        report.config.altc_eco_vbatt_on_v,
+        report.config.iab_enabled,
+        report.config.iab_invert,
+        report.config.iab_engage_rpm,
+        report.config.iab_disengage_rpm,
+        report.config.evap_enabled,
+        report.config.pe0_mode,
+        report.config.pe1_mode
+    );
+}
+
+fn run_aux_status(port_path: &str) -> Result<()> {
+    let mut port = open_serial(port_path)?;
+    match native_rpc(&mut port, &Request::GetAuxStatus)? {
+        Response::AuxStatus(report) => {
+            print_aux_status(&report);
+            Ok(())
+        }
+        Response::Error(err) => bail!("GetAuxStatus failed: {err:?}"),
+        other => bail!("unexpected GetAuxStatus response: {other:?}"),
+    }
+}
+
+fn run_burn_config(port_path: &str) -> Result<()> {
+    let mut port = open_serial(port_path)?;
+    commit_runtime_cfg(&mut port)?;
+    println!("Persisted active Knock DSP + Aux I/O configurations to SPI1 Flash NVM.");
+    Ok(())
 }
 
 fn main() -> Result<()> {
@@ -1300,6 +1413,7 @@ fn main() -> Result<()> {
             threshold_x100,
             step_deg_x10,
             max_deg_x10,
+            burn,
         } => run_knock_cfg(
             &port,
             enabled,
@@ -1310,7 +1424,11 @@ fn main() -> Result<()> {
             threshold_x100,
             step_deg_x10,
             max_deg_x10,
+            burn,
         ),
+        Commands::ClearFaults { port } => run_clear_faults(&port),
+        Commands::AuxStatus { port } => run_aux_status(&port),
+        Commands::BurnConfig { port } => run_burn_config(&port),
     }
 }
 
