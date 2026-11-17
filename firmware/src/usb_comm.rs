@@ -15,8 +15,8 @@ use embassy_usb::driver::EndpointError;
 use embassy_usb::{Builder, Config as UsbConfig, UsbDevice};
 use heapless::Vec;
 use proto_native::{
-    AuxStatusReport, KnockStatusReport, MAX_CHUNK_BYTES, ProtoError, Request, Response,
-    SD_FORMAT_CONFIRM_MAGIC, decode_frame, encode_frame,
+    AuxStatusReport, BusStatusReport, KnockStatusReport, MAX_CHUNK_BYTES, ProtoError, Request,
+    Response, SD_FORMAT_CONFIRM_MAGIC, decode_frame, encode_frame,
 };
 use proto_tunerstudio::{
     TS_ERR_OUT_OF_RANGE, TS_FLAG_BURN_OK, TS_PAGE_SIZE, handle_ts_packet,
@@ -533,6 +533,17 @@ async fn dispatch_native_request(
             }
         }
         Request::GetNvmStatus => Response::NvmStatus(nvm.status_report()),
+        Request::GetBusStatus => {
+            let can_st = crate::can_hw::stats();
+            Response::BusStatus(BusStatusReport {
+                can_self_test_passed: can_st.self_test_passed,
+                can_tx_ok: can_st.tx_ok,
+                can_tx_drop: can_st.tx_drop,
+                can_rx_count: can_st.rx_count,
+                can_tec: can_st.tec,
+                dlc_answered_frames: crate::dlc_hw::answered_frame_count(),
+            })
+        }
     }
 }
 

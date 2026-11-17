@@ -141,6 +141,8 @@ pub enum Request {
     CommitRuntimeConfigToNvm,
     /// Reads detected `SPI1` NVM medium (`SpiNorFlash` vs `SpiFram`), RDID, capacity & slot info.
     GetNvmStatus,
+    /// Reads live `FDCAN1` (`PD0`/`PD1`) and Honda `D7 DLC` (`PA9`/`PA10`) bus diagnostics.
+    GetBusStatus,
 }
 
 /// Live Knock Window DSP config & telemetry snapshot returned by [`Request::GetKnockStatus`].
@@ -156,6 +158,19 @@ pub struct KnockStatusReport {
 pub struct AuxStatusReport {
     pub config: AuxIoConfig,
     pub telemetry: AuxIoTelemetry,
+}
+
+/// Live `FDCAN1` (`PD0`/`PD1`) and Honda `D7 DLC` (`PA9`/`PA10`) status returned by
+/// [`Request::GetBusStatus`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+pub struct BusStatusReport {
+    pub can_self_test_passed: bool,
+    pub can_tx_ok: u32,
+    pub can_tx_drop: u32,
+    pub can_rx_count: u32,
+    pub can_tec: u8,
+    pub dlc_answered_frames: u32,
 }
 
 /// ECU-to-Host RPC response (`no_std` stack-allocated; `Box` intentionally avoided).
@@ -188,6 +203,7 @@ pub enum Response {
     KnockStatus(KnockStatusReport),
     AuxStatus(AuxStatusReport),
     NvmStatus(NvmStatusReport),
+    BusStatus(BusStatusReport),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -340,7 +356,7 @@ mod tests {
     use heapless::Vec;
 
     use super::{
-        AuxStatusReport, KnockStatusReport, MAX_CHUNK_BYTES, MAX_FRAME_BYTES,
+        AuxStatusReport, BusStatusReport, KnockStatusReport, MAX_CHUNK_BYTES, MAX_FRAME_BYTES,
         MAX_RUNTIME_CONFIG_BYTES, ProtoError, Request, Response, SD_FORMAT_CONFIRM_MAGIC,
         SdDirEntry, SdDiskKind, SdStatusReport, cobs_decode, cobs_encode_with_delimiter,
         decode_frame, decode_runtime_config, encode_frame, encode_runtime_config,
@@ -575,6 +591,26 @@ mod tests {
         assert_eq!(
             decode_frame::<Response>(&wire[..nvm_resp_len]),
             Ok(nvm_resp)
+        );
+
+        let bus_req_len =
+            encode_frame(&Request::GetBusStatus, &mut wire).expect("encode GetBusStatus");
+        assert_eq!(
+            decode_frame::<Request>(&wire[..bus_req_len]),
+            Ok(Request::GetBusStatus)
+        );
+        let bus_resp = Response::BusStatus(BusStatusReport {
+            can_self_test_passed: true,
+            can_tx_ok: 120,
+            can_tx_drop: 3,
+            can_rx_count: 15,
+            can_tec: 0,
+            dlc_answered_frames: 4,
+        });
+        let bus_resp_len = encode_frame(&bus_resp, &mut wire).expect("encode BusStatus");
+        assert_eq!(
+            decode_frame::<Response>(&wire[..bus_resp_len]),
+            Ok(bus_resp)
         );
     }
 }

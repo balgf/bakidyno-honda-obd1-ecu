@@ -14,9 +14,9 @@ use ecu_core::datalog::{
 use ecu_core::sensors::{ADC_FULL_SCALE, VREF_VOLTS};
 use ecu_types::{CalibrationBlob, FaultFlags, RawSensorAdc, SwitchState, crc32};
 use proto_native::{
-    AuxStatusReport, KnockConfig, KnockStatusReport, MAX_CHUNK_BYTES, MAX_FRAME_BYTES,
-    NvmStatusReport, ProtoError, Request, Response, SD_FORMAT_CONFIRM_MAGIC, SdDiskKind,
-    SdStatusReport, decode_frame, encode_frame,
+    AuxStatusReport, BusStatusReport, KnockConfig, KnockStatusReport, MAX_CHUNK_BYTES,
+    MAX_FRAME_BYTES, NvmStatusReport, ProtoError, Request, Response, SD_FORMAT_CONFIRM_MAGIC,
+    SdDiskKind, SdStatusReport, decode_frame, encode_frame,
 };
 use proto_tunerstudio::{
     TS_FLAG_BURN_OK, TS_FLAG_OK, TS_OCH_SIZE, TS_PAGE_SIZE, TS_PROTO_VERSION, TS_SIGNATURE,
@@ -140,6 +140,11 @@ enum Commands {
     },
     /// Query auto-detected SPI1 NOR Flash / FRAM hardware identity and slot state
     NvmStatus {
+        #[arg(long, default_value = "/dev/ttyACM0")]
+        port: String,
+    },
+    /// Query live FDCAN1 (PD0/PD1) and Honda D7 DLC (PA9/PA10) bus counters
+    BusStatus {
         #[arg(long, default_value = "/dev/ttyACM0")]
         port: String,
     },
@@ -1442,6 +1447,35 @@ fn run_nvm_status(port_path: &str) -> Result<()> {
     }
 }
 
+fn print_bus_status(report: &BusStatusReport) {
+    println!("Vehicle Bus & Honda DLC Status Report");
+    println!("-------------------------------------");
+    println!(
+        "FDCAN1 (500k): self_test={} | tx_ok={} | tx_drop={} | rx_count={} | tec={}",
+        report.can_self_test_passed,
+        report.can_tx_ok,
+        report.can_tx_drop,
+        report.can_rx_count,
+        report.can_tec
+    );
+    println!(
+        "Honda D7 DLC : answered_frames={}",
+        report.dlc_answered_frames
+    );
+}
+
+fn run_bus_status(port_path: &str) -> Result<()> {
+    let mut port = open_serial(port_path)?;
+    match native_rpc(&mut port, &Request::GetBusStatus)? {
+        Response::BusStatus(report) => {
+            print_bus_status(&report);
+            Ok(())
+        }
+        Response::Error(err) => bail!("GetBusStatus failed: {err:?}"),
+        other => bail!("unexpected GetBusStatus response: {other:?}"),
+    }
+}
+
 fn run_burn_config(port_path: &str) -> Result<()> {
     let mut port = open_serial(port_path)?;
     commit_runtime_cfg(&mut port)?;
@@ -1494,6 +1528,7 @@ fn main() -> Result<()> {
         Commands::AuxStatus { port } => run_aux_status(&port),
         Commands::BurnConfig { port } => run_burn_config(&port),
         Commands::NvmStatus { port } => run_nvm_status(&port),
+        Commands::BusStatus { port } => run_bus_status(&port),
     }
 }
 

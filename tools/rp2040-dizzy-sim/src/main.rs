@@ -12,6 +12,7 @@
 //! - `GP6`  -> `22kΩ/100kΩ -> 104 -> MCP6004 1.65V AFE -> STM32 PC2_C` (`7.5 kHz` Cyl-3 burst)
 //! - `GP8`  -> `STM32 PE15` (`FLEX`: Continental `135.0 Hz` `E85`, `2.5 ms` pulse = `21.9 °C`)
 //! - `GP10` -> `STM32 PB7`  (`ALTF*`: `125.0 Hz`, `35.0%` HIGH field duty)
+//! - `GP12` -> `STM32 PA10` (`UART0 TX` `9600 bps 8N1` periodic Honda `D7 DLC` `Identify`/`ReadTable`)
 //! - `GP24` <- Onboard `YD-RP2040` `USR` button (click toggles `Cyl-3` `7.5 kHz` knock bursts)
 //! - `GP26` (`ADC0`) <- `10K` rotary potentiometer (`0V..3.3V` sweeps `150 RPM .. 9,000 RPM`!)
 //! - `GND`  -> Shared `GND` rail with `STM32H743VIT6`
@@ -21,6 +22,7 @@ use embassy_executor::Spawner;
 use embassy_rp::adc::{Adc, Channel, Config as AdcConfig};
 use embassy_rp::gpio::{Input, Level, Output, Pull};
 use embassy_rp::pwm::{Config as PwmConfig, Pwm, SetDutyCycle};
+use embassy_rp::uart::{Blocking, Config as UartConfig, UartTx};
 use embassy_time::{Duration, Timer};
 use fixed::traits::ToFixed;
 use {defmt_rtt as _, panic_probe as _};
@@ -38,8 +40,23 @@ const FLEX_TEMP_22C_COMPARE: u16 = 1_250;
 const ALTF_125HZ_TOP: u16 = 3_999;
 const ALTF_35PCT_COMPARE: u16 = 1_400;
 
+#[embassy_executor::task]
+async fn dlc_query_task(mut tx: UartTx<'static, Blocking>) -> ! {
+    // Honda D7 DLC 9600 bps requests with valid two's-complement checksums (sum == 0 mod 256):
+    // - Identify (`0xfe`): replies with `0xfe 0x07 "H743" 0xe2`
+    // - ReadTable (`offset=0x00, count=0x10`): replies with 16 bytes live telemetry
+    const DLC_IDENTIFY_REQ: [u8; 4] = [0xfe, 0x04, 0x00, 0xfe];
+    const DLC_READ_TABLE_REQ: [u8; 5] = [0x20, 0x05, 0x00, 0x10, 0xcb];
+    loop {
+        Timer::after(Duration::from_millis(1_000)).await;
+        let _ = tx.blocking_write(&DLC_IDENTIFY_REQ);
+        Timer::after(Duration::from_millis(250)).await;
+        let _ = tx.blocking_write(&DLC_READ_TABLE_REQ);
+    }
+}
+
 #[embassy_executor::main]
-async fn main(_spawner: Spawner) {
+async fn main(spawner: Spawner) {
     let p = embassy_rp::init(Default::default());
 
     let mut ckp_out = Output::new(p.PIN_2, Level::Low);
@@ -65,6 +82,11 @@ async fn main(_spawner: Spawner) {
     altf_cfg.top = ALTF_125HZ_TOP;
     altf_cfg.compare_a = ALTF_35PCT_COMPARE;
     let _altf_pwm = Pwm::new_output_a(p.PWM_SLICE5, p.PIN_10, altf_cfg);
+
+    let mut dlc_uart_cfg = UartConfig::default();
+    dlc_uart_cfg.baudrate = 9_600;
+    let dlc_tx = UartTx::new_blocking(p.UART0, p.PIN_12, dlc_uart_cfg);
+    spawner.spawn(dlc_query_task(dlc_tx).expect("valid dlc_query_task token"));
 
     let mut adc = Adc::new_blocking(p.ADC, AdcConfig::default());
     let mut rpm_pot = Channel::new_pin(p.PIN_26, Pull::None);
