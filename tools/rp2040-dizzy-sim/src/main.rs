@@ -1,7 +1,7 @@
 #![no_std]
 #![no_main]
 
-//! `RP2040` Honda OBD1 `24/4/1` Distributor + `VSS` + `Cyl-3` Knock Test Bench Simulator
+//! `RP2040` Honda OBD1 `24/4/1` Distributor + `VSS` + `Cyl-3` Knock + `FLEX`/`ALTF*` Simulator
 //! (`_DOCS/breadboard_stage1.md`).
 //!
 //! Stage 1 Breadboard Wiring (`3.3V` safe direct to `STM32H743VIT6`):
@@ -9,7 +9,9 @@
 //! - `GP3`  -> `STM32 PA1`  (`TDC_CAPTURE` — 4 pulses per `720°` cam rev, every 6 `CKP` teeth)
 //! - `GP4`  -> `STM32 PB10` (`CYP_CAPTURE` — 1 pulse per `720°` cam rev, leads Tooth 0)
 //! - `GP5`  -> `STM32 PB11` (`VSS_CAPTURE` — simulated vehicle speed proportional to RPM)
-//! - `GP6`  -> `22kΩ -> 10nF -> MCP6001/MCP6004 1.65V AFE -> STM32 PC2_C` (`7.5 kHz` Cyl-3 burst)
+//! - `GP6`  -> `22kΩ/100kΩ -> 104 -> MCP6004 1.65V AFE -> STM32 PC2_C` (`7.5 kHz` Cyl-3 burst)
+//! - `GP8`  -> `STM32 PE15` (`FLEX`: Continental `135.0 Hz` `E85`, `2.5 ms` pulse = `21.9 °C`)
+//! - `GP10` -> `STM32 PB7`  (`ALTF*`: `125.0 Hz`, `35.0%` HIGH field duty)
 //! - `GP24` <- Onboard `YD-RP2040` `USR` button (click toggles `Cyl-3` `7.5 kHz` knock bursts)
 //! - `GP26` (`ADC0`) <- `10K` rotary potentiometer (`0V..3.3V` sweeps `150 RPM .. 9,000 RPM`!)
 //! - `GND`  -> Shared `GND` rail with `STM32H743VIT6`
@@ -20,11 +22,21 @@ use embassy_rp::adc::{Adc, Channel, Config as AdcConfig};
 use embassy_rp::gpio::{Input, Level, Output, Pull};
 use embassy_rp::pwm::{Config as PwmConfig, Pwm, SetDutyCycle};
 use embassy_time::{Duration, Timer};
+use fixed::traits::ToFixed;
 use {defmt_rtt as _, panic_probe as _};
 
 /// `125.0 MHz / (16_666 + 1) = 7,499.85 Hz` (`50%` duty = `8_333`), centered on `KnockBiquad`.
 const KNOCK_7500HZ_TOP: u16 = 16_666;
 const KNOCK_7500HZ_HALF_DUTY: u16 = 8_333;
+
+/// `125.0 MHz / 250 = 500.000 kHz` (`2.000 µs` per PWM tick) for low-frequency `FLEX`/`ALTF*`.
+const AUX_PWM_DIVIDER: u16 = 250;
+/// `3,704 × 2 µs = 7,408 µs` (`134.99 Hz` -> `E85` / `85.0%` ethanol); `1,250 × 2 µs = 2.50 ms` (`21.9 °C`).
+const FLEX_E85_TOP: u16 = 3_703;
+const FLEX_TEMP_22C_COMPARE: u16 = 1_250;
+/// `4,000 × 2 µs = 8,000 µs` (`125.00 Hz`); `1,400 / 4,000 = 35.0%` HIGH duty.
+const ALTF_125HZ_TOP: u16 = 3_999;
+const ALTF_35PCT_COMPARE: u16 = 1_400;
 
 #[embassy_executor::main]
 async fn main(_spawner: Spawner) {
@@ -42,12 +54,24 @@ async fn main(_spawner: Spawner) {
     pwm_cfg.compare_a = 0;
     let mut knock_pwm = Pwm::new_output_a(p.PWM_SLICE3, p.PIN_6, pwm_cfg);
 
+    let mut flex_cfg = PwmConfig::default();
+    flex_cfg.divider = AUX_PWM_DIVIDER.to_fixed();
+    flex_cfg.top = FLEX_E85_TOP;
+    flex_cfg.compare_a = FLEX_TEMP_22C_COMPARE;
+    let _flex_pwm = Pwm::new_output_a(p.PWM_SLICE4, p.PIN_8, flex_cfg);
+
+    let mut altf_cfg = PwmConfig::default();
+    altf_cfg.divider = AUX_PWM_DIVIDER.to_fixed();
+    altf_cfg.top = ALTF_125HZ_TOP;
+    altf_cfg.compare_a = ALTF_35PCT_COMPARE;
+    let _altf_pwm = Pwm::new_output_a(p.PWM_SLICE5, p.PIN_10, altf_cfg);
+
     let mut adc = Adc::new_blocking(p.ADC, AdcConfig::default());
     let mut rpm_pot = Channel::new_pin(p.PIN_26, Pull::None);
 
     info!(
         "RP2040 Honda OBD1 24/4/1 Dizzy Simulator running \
-         (GP2=CKP, GP3=TDC, GP4=CYP, GP6=7.5kHz Cyl3 Knock, GP24=USR Toggle, GP26=RPM)"
+         (GP2=CKP, GP3=TDC, GP4=CYP, GP6=7.5kHz Knock, GP8=FLEX E85, GP10=ALTF 35%, GP24=USR, GP26=RPM)"
     );
 
     let mut tooth: u8 = 0;

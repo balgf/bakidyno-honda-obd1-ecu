@@ -43,8 +43,8 @@ Open-source standalone Engine Control Unit written in `no_std` Rust for 1992–1
 | **Step 6: USB CDC-ACM, `SPI1` NVM & Tuner** | Dual-protocol USB mux (`proto-native` + TunerStudio `msEnvelope_1.0`) + auto-detected `SPI1` NOR Flash (`PY25Q64HA`/`W25Q64`) & Stage 2 FRAM (`FM25V02A`/`MB85RS256B`) (`CalibrationBlob` + `KnockConfig`/`AuxIoConfig`) + `ClearFaults` | Flash verified; FRAM ready |
 | **Bosch LSU 4.9 Wideband Hardware Driver** | `DAC1` (`PA4`/`PA5`), `TIM15` `4 kHz` Nernst `Ri` AC (`PE5`), `ADC2` synchronous injected sampling (`PA6`/`PA7`), `TIM17` `100 Hz` heater PWM (`PB9`) | Closed-loop bench validated |
 | **Knock Window DSP & `SDMMC1` `.BDL` Logger** | `ADC3` `200 kS/s` `TIM6/7` + `BDMA_CH0` -> `.sram4` (`1.65 V` `MCP6004` AFE, Cyl-3 `7.5 kHz` retard, `Code 23` diag, `0` overruns) & non-blocking `SDMMC1` 4-bit FAT32 (`500 Hz` `.BDL`, `0` drops) + `LSE` `RTC` | Verified on live STM32H743 |
-| **Vehicle Bus, Honda DLC & Aux I/O** | `FDCAN1` `500 kbps` (`0x640..0x642`), `USART1` `9600 bps` `D7 DLC`, `EXTI` (`PB7` `ALTF*`, `PE15` Flex Fuel), aux low-side drivers (`ALTC*`, `IAB*`, `EVAP*`, `PE0`/`PE1`) | Boot & `FDCAN1` loopback verified; external harness pending |
-| **Remaining Roadmap** | External transceiver/LSU4.9/FRAM physical tests (`FDCAN1`, `D7 DLC`, `FLEX`/`ALTF*`), Stage 2 OBD1 KiCad PCB & in-car commissioning | Planned |
+| **Vehicle Bus, Honda DLC & Aux I/O** | `FDCAN1` `500 kbps` (`0x640..0x642`), `USART1` `9600 bps` `D7 DLC`, `EXTI` (`PB7` `ALTF*` `125 Hz / 35%` & `PE15` `E85` `135 Hz` verified), aux low-side drivers (`ALTC*`, `IAB*`, `EVAP*`, `PE0`/`PE1`) | `FLEX`/`ALTF*` & `FDCAN1` loopback verified; external CAN/DLC harness pending |
+| **Remaining Roadmap** | External `FDCAN1`/`D7 DLC`/LSU4.9/FRAM transceiver tests, Stage 2 OBD1 KiCad PCB & in-car commissioning | Planned |
 
 ---
 

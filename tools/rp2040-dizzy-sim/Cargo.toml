@@ -19,6 +19,7 @@ cortex-m = "0.7"
 cortex-m-rt = "0.7"
 defmt = "1.0"
 defmt-rtt = "1.0"
+fixed = "1.31"
 panic-probe = { version = "1.0", features = ["print-defmt"] }
 
 [profile.dev]
