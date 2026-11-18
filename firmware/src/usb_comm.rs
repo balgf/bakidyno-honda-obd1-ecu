@@ -16,9 +16,9 @@ use embassy_usb::driver::EndpointError;
 use embassy_usb::{Builder, Config as UsbConfig, UsbDevice};
 use heapless::Vec;
 use proto_native::{
-    AuxStatusReport, BoostStatusReport, BusStatusReport, KnockStatusReport, MAX_CHUNK_BYTES,
-    OutputTestCommand, ProtoError, Request, Response, SD_FORMAT_CONFIRM_MAGIC, decode_frame,
-    encode_frame,
+    AuxStatusReport, BoostStatusReport, BusStatusReport, EcuCapabilitiesReport, KnockStatusReport,
+    MAX_CHUNK_BYTES, OutputTestCommand, ProtoError, Request, Response, SD_FORMAT_CONFIRM_MAGIC,
+    decode_frame, encode_frame,
 };
 use proto_tunerstudio::{
     TS_ERR_OUT_OF_RANGE, TS_FLAG_BURN_OK, TS_PAGE_SIZE, handle_ts_packet,
@@ -602,6 +602,9 @@ async fn dispatch_native_request(
                 fp_ms = 0;
             }
             Response::DiagStatus(HardwareOutputs::diag_status(fp_ms))
+        }
+        Request::GetCapabilities => {
+            Response::Capabilities(EcuCapabilitiesReport::honda_obd1_stage2())
         }
     }
 }

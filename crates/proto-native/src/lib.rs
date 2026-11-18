@@ -5,7 +5,8 @@
 
 pub use ecu_types::{
     AltfState, AuxIoConfig, AuxIoTelemetry, AuxOutputs, AuxSpareMode, BoostConfig, BoostMode,
-    BoostTelemetry, DiagStatusReport, FlexFuelState, FlexSensorStatus, KnockConfig, KnockTelemetry,
+    BoostTelemetry, DiagStatusReport, EcuCapabilitiesReport, EcuFeatureFlags, EcuIgnitionKind,
+    EcuPlatform, EcuTriggerKind, FlexFuelState, FlexSensorStatus, KnockConfig, KnockTelemetry,
     NvmMedium, NvmStatusReport, OutputEnableMask, OutputTestCommand, RUNTIME_CONFIG_MAGIC,
     RUNTIME_CONFIG_VERSION, RuntimeConfigBlob,
 };
@@ -161,6 +162,8 @@ pub enum Request {
     TriggerOutputTest {
         cmd: OutputTestCommand,
     },
+    /// Queries ECU platform, trigger/ignition topology, and supported hardware features.
+    GetCapabilities,
 }
 
 /// Live Knock Window DSP config & telemetry snapshot returned by [`Request::GetKnockStatus`].
@@ -232,6 +235,7 @@ pub enum Response {
     NvmStatus(NvmStatusReport),
     BusStatus(BusStatusReport),
     DiagStatus(DiagStatusReport),
+    Capabilities(EcuCapabilitiesReport),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -676,6 +680,19 @@ mod tests {
         assert_eq!(
             decode_frame::<Response>(&wire[..bus_resp_len]),
             Ok(bus_resp)
+        );
+
+        let cap_req_len =
+            encode_frame(&Request::GetCapabilities, &mut wire).expect("encode GetCapabilities");
+        assert_eq!(
+            decode_frame::<Request>(&wire[..cap_req_len]),
+            Ok(Request::GetCapabilities)
+        );
+        let cap_resp = Response::Capabilities(super::EcuCapabilitiesReport::honda_obd1_stage2());
+        let cap_resp_len = encode_frame(&cap_resp, &mut wire).expect("encode Capabilities");
+        assert_eq!(
+            decode_frame::<Response>(&wire[..cap_resp_len]),
+            Ok(cap_resp)
         );
     }
 }

@@ -1178,6 +1178,110 @@ pub struct DiagStatusReport {
     pub cop_watchdog_count: u32,
 }
 
+/// Target automotive platform / harness family reported by ECU firmware.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+#[repr(u8)]
+pub enum EcuPlatform {
+    HondaObd1 = 0,
+    Toyota4aFe = 1,
+    Universal4Cyl = 2,
+}
+
+/// Crank/cam trigger decoder topology implemented by ECU firmware.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+#[repr(u8)]
+pub enum EcuTriggerKind {
+    Honda24_4_1 = 0,
+    Toyota24_2NeG = 1,
+    MissingTooth36_2 = 2,
+}
+
+/// Ignition driver topology supported by ECU hardware/firmware.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+#[repr(u8)]
+pub enum EcuIgnitionKind {
+    SmartCop4Ch = 0,
+    DistributorSingleCoil = 1,
+    WastedSpark2Ch = 2,
+}
+
+/// Bitmask of hardware and firmware features supported by the connected ECU.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+pub struct EcuFeatureFlags(pub u32);
+
+impl EcuFeatureFlags {
+    pub const NONE: u32 = 0;
+    pub const VTEC: u32 = 1 << 0;
+    pub const ELD: u32 = 1 << 1;
+    pub const SMART_ALTERNATOR: u32 = 1 << 2;
+    pub const IAB: u32 = 1 << 3;
+    pub const KNOCK_DSP: u32 = 1 << 4;
+    pub const FLEX_FUEL: u32 = 1 << 5;
+    pub const EBC_BOOST: u32 = 1 << 6;
+    pub const LAUNCH_2STEP: u32 = 1 << 7;
+    pub const FLAT_FOOT_SHIFT: u32 = 1 << 8;
+    pub const WIDEBAND_LSU49: u32 = 1 << 9;
+    pub const SD_DATALOGGER: u32 = 1 << 10;
+
+    #[inline]
+    pub const fn contains(self, bit: u32) -> bool {
+        (self.0 & bit) != 0
+    }
+}
+
+/// Hardware and firmware capabilities reported via `Request::GetCapabilities`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+pub struct EcuCapabilitiesReport {
+    pub platform: EcuPlatform,
+    pub trigger: EcuTriggerKind,
+    pub ignition: EcuIgnitionKind,
+    pub cylinders: u8,
+    pub cal_version: u16,
+    pub features: EcuFeatureFlags,
+    pub max_map_kpa: u16,
+    pub board_rev_major: u8,
+    pub board_rev_minor: u8,
+}
+
+impl EcuCapabilitiesReport {
+    /// Canonical capability descriptor for the STM32H743 Stage 2 Honda OBD1 ECU firmware.
+    pub const fn honda_obd1_stage2() -> Self {
+        Self {
+            platform: EcuPlatform::HondaObd1,
+            trigger: EcuTriggerKind::Honda24_4_1,
+            ignition: EcuIgnitionKind::SmartCop4Ch,
+            cylinders: 4,
+            cal_version: CALIBRATION_VERSION,
+            features: EcuFeatureFlags(
+                EcuFeatureFlags::VTEC
+                    | EcuFeatureFlags::ELD
+                    | EcuFeatureFlags::SMART_ALTERNATOR
+                    | EcuFeatureFlags::IAB
+                    | EcuFeatureFlags::KNOCK_DSP
+                    | EcuFeatureFlags::FLEX_FUEL
+                    | EcuFeatureFlags::EBC_BOOST
+                    | EcuFeatureFlags::LAUNCH_2STEP
+                    | EcuFeatureFlags::FLAT_FOOT_SHIFT
+                    | EcuFeatureFlags::WIDEBAND_LSU49
+                    | EcuFeatureFlags::SD_DATALOGGER,
+            ),
+            max_map_kpa: 450,
+            board_rev_major: 2,
+            board_rev_minor: 0,
+        }
+    }
+
+    #[inline]
+    pub const fn has_feature(self, bit: u32) -> bool {
+        self.features.contains(bit)
+    }
+}
+
 /// Computes IEEE 802.3 CRC-32 over an arbitrary byte slice.
 #[inline]
 pub fn crc32(bytes: &[u8]) -> u32 {
@@ -1237,5 +1341,11 @@ mod tests {
         assert!(faults.contains(FaultFlags::MAP_RANGE));
         assert!(faults.contains(FaultFlags::WIDEBAND_FAULT));
         assert!(!faults.contains(FaultFlags::ECT_RANGE));
+
+        let caps = super::EcuCapabilitiesReport::honda_obd1_stage2();
+        assert_eq!(caps.platform, super::EcuPlatform::HondaObd1);
+        assert_eq!(caps.trigger, super::EcuTriggerKind::Honda24_4_1);
+        assert!(caps.has_feature(super::EcuFeatureFlags::VTEC));
+        assert!(caps.has_feature(super::EcuFeatureFlags::EBC_BOOST));
     }
 }

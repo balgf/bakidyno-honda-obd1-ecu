@@ -561,6 +561,18 @@ fn run_probe(port_path: &str) -> Result<()> {
         ),
         other => bail!("unexpected Ping response: {other:?}"),
     }
+    if let Ok(Response::Capabilities(cap)) = native_rpc(&mut port, &Request::GetCapabilities) {
+        println!(
+            "Capabilities: {:?} | trigger={:?} | ign={:?} | cyl={} | hw=rev{}.{} | features=0x{:08x}",
+            cap.platform,
+            cap.trigger,
+            cap.ignition,
+            cap.cylinders,
+            cap.board_rev_major,
+            cap.board_rev_minor,
+            cap.features.0
+        );
+    }
     match telemetry {
         Response::Telemetry(t) => {
             println!(
