@@ -169,7 +169,7 @@ impl SensorProcessor {
         );
         let map_raw_kpa =
             map_cal.kpa_at_0v + (map_v / 5.0) * (map_cal.kpa_at_5v - map_cal.kpa_at_0v);
-        let map_kpa = self.map_lpf.update(map_raw_kpa.clamp(10.0, 320.0));
+        let map_kpa = self.map_lpf.update(map_raw_kpa.clamp(10.0, 450.0));
 
         // 3. D11 TPS
         let tps_v = to_ratiometric_5v(raw.tps_raw);
@@ -378,5 +378,38 @@ mod tests {
             ..idle_pins
         };
         assert!(vtec_pins.decode().vtp_pressurized);
+    }
+
+    #[test]
+    fn four_bar_map_reads_above_320_kpa_up_to_430_kpa() {
+        let mut proc_4bar = super::SensorProcessor::new();
+        let cal_4bar = MapSensorCal {
+            kpa_at_0v: 0.0,
+            kpa_at_5v: 430.0,
+        };
+        let mut faults = FaultFlags::default();
+        let raw_400kpa = RawSensorAdc {
+            vcc_5v_raw: volts_5v_to_adc(5.00),
+            map_raw: volts_5v_to_adc(400.0 / 430.0 * 5.0),
+            tps_raw: volts_5v_to_adc(2.0),
+            ect_raw: volts_5v_to_adc(0.45),
+            iat_raw: volts_5v_to_adc(2.41),
+            vbatt_raw: (((14.0 * 15.0 / 115.0) / super::VREF_VOLTS) * super::ADC_FULL_SCALE) as u16,
+            eld_raw: volts_5v_to_adc(3.5),
+            ..Default::default()
+        };
+        let snap = proc_4bar.process(
+            &raw_400kpa,
+            SwitchState::default(),
+            0.0,
+            &cal_4bar,
+            &mut faults,
+        );
+        assert!(
+            snap.map_kpa > 395.0 && snap.map_kpa < 405.0,
+            "got {}",
+            snap.map_kpa
+        );
+        assert!(faults.is_empty());
     }
 }

@@ -6,7 +6,8 @@ use crate::trigger::{
     angle_offset_in_tooth_window,
 };
 use ecu_types::{
-    CYLINDER_TDC_DEG_X10, CalibrationBlob, Cylinder, HONDA_FIRING_ORDER, SensorSnapshot, SyncState,
+    CYLINDER_TDC_DEG_X10, CalibrationBlob, Cylinder, HONDA_FIRING_ORDER, OutputEnableMask,
+    SensorSnapshot, SyncState,
 };
 
 /// Hardware `TIM1` Output Compare action to arm during the upcoming `30.0°` `CKP` tooth window.
@@ -59,8 +60,27 @@ impl IgnitionToothScheduler {
         per_cyl_knock_retard_deg_x10: &[i16; 4],
         dwell_us: u32,
     ) -> ToothScheduleBatch {
+        self.schedule_on_ckp_tooth_masked(
+            tooth,
+            spark_advance_deg_x10,
+            per_cyl_knock_retard_deg_x10,
+            dwell_us,
+            OutputEnableMask::all_enabled(),
+        )
+    }
+
+    /// Like [`Self::schedule_on_ckp_tooth`], suppressing any cylinder disabled in `mask`.
+    pub fn schedule_on_ckp_tooth_masked(
+        &mut self,
+        tooth: &CkpToothEvent,
+        spark_advance_deg_x10: i16,
+        per_cyl_knock_retard_deg_x10: &[i16; 4],
+        dwell_us: u32,
+        mask: OutputEnableMask,
+    ) -> ToothScheduleBatch {
         let mut batch = ToothScheduleBatch::default();
-        if tooth.sync_state != SyncState::FullSynced720 || tooth.rpm == 0 {
+        if tooth.sync_state != SyncState::FullSynced720 || tooth.rpm == 0 || !mask.ignition_enabled
+        {
             self.reset_cycle();
             return batch;
         }
@@ -74,6 +94,11 @@ impl IgnitionToothScheduler {
 
         for &cyl in &HONDA_FIRING_ORDER {
             let idx = cyl.index();
+            if !mask.is_cop_enabled(cyl) {
+                self.dwell_scheduled_in_cycle[idx] = false;
+                self.spark_scheduled_in_cycle[idx] = false;
+                continue;
+            }
             let tdc_x10 = CYLINDER_TDC_DEG_X10[idx] as i32;
             let reset_x10 = (tdc_x10 + IGN_RESET_OFFSET_FROM_TDC_X10).rem_euclid(7200) as u16;
             if angle_offset_in_tooth_window(tooth.crank_angle_deg_x10, reset_x10).is_some() {
@@ -191,6 +216,30 @@ impl IgnitionModel {
         timing_override_deg_x10: Option<i16>,
         cal: &CalibrationBlob,
     ) -> (i16, u32) {
+        self.compute_1khz_with_trims(
+            rpm,
+            use_vtec_map,
+            sensors,
+            timing_override_deg_x10,
+            0,
+            None,
+            cal,
+        )
+    }
+
+    /// Computes spark advance (`0.1° BTDC`) including Flex Fuel octane advance and optional
+    /// blended 2-step launch / flat-foot shift retard target.
+    #[allow(clippy::too_many_arguments)]
+    pub fn compute_1khz_with_trims(
+        &self,
+        rpm: u16,
+        use_vtec_map: bool,
+        sensors: &SensorSnapshot,
+        timing_override_deg_x10: Option<i16>,
+        flex_add_deg_x10: i16,
+        spark_blend_target: Option<(i16, f32)>,
+        cal: &CalibrationBlob,
+    ) -> (i16, u32) {
         let dwell_us = interp_1d_u16(
             &cal.vbatt_bins_x10,
             &cal.cop_dwell_us,
@@ -226,12 +275,21 @@ impl IgnitionModel {
             sensors.map_kpa,
         ) as i16;
 
+        // Ethanol octane advance trim
+        adv_x10 = adv_x10.saturating_add(flex_add_deg_x10);
+
         // High intake-air / coolant safety retard (> 50 °C IAT or > 102 °C ECT)
         if sensors.iat_c > 50.0 {
             adv_x10 -= ((sensors.iat_c - 50.0) * 1.5) as i16;
         }
         if sensors.ect_c > 102.0 {
             adv_x10 -= ((sensors.ect_c - 102.0) * 3.0) as i16;
+        }
+
+        if let Some((target_deg_x10, blend)) = spark_blend_target {
+            let t = blend.clamp(0.0, 1.0);
+            let blended = adv_x10 as f32 + ((target_deg_x10 - adv_x10) as f32 * t);
+            return ((blended as i16).clamp(-150, 450), dwell_us);
         }
 
         (adv_x10.clamp(-50, 450), dwell_us)
@@ -248,11 +306,28 @@ impl IgnitionModel {
         spark_advance_deg_x10: i16,
         dwell_us: u32,
     ) -> ToothScheduleBatch {
-        self.tooth_scheduler.schedule_on_ckp_tooth(
+        self.schedule_on_ckp_tooth_masked(
+            tooth,
+            spark_advance_deg_x10,
+            dwell_us,
+            OutputEnableMask::all_enabled(),
+        )
+    }
+
+    /// Like [`Self::schedule_on_ckp_tooth`], suppressing any cylinder disabled in `mask`.
+    pub fn schedule_on_ckp_tooth_masked(
+        &mut self,
+        tooth: &CkpToothEvent,
+        spark_advance_deg_x10: i16,
+        dwell_us: u32,
+        mask: OutputEnableMask,
+    ) -> ToothScheduleBatch {
+        self.tooth_scheduler.schedule_on_ckp_tooth_masked(
             tooth,
             spark_advance_deg_x10,
             &self.per_cyl_knock_retard_deg_x10,
             dwell_us,
+            mask,
         )
     }
 }

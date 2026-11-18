@@ -14,9 +14,9 @@ use ecu_core::datalog::{
 use ecu_core::sensors::{ADC_FULL_SCALE, VREF_VOLTS};
 use ecu_types::{CalibrationBlob, FaultFlags, RawSensorAdc, SwitchState, crc32};
 use proto_native::{
-    AuxStatusReport, BusStatusReport, KnockConfig, KnockStatusReport, MAX_CHUNK_BYTES,
-    MAX_FRAME_BYTES, NvmStatusReport, ProtoError, Request, Response, SD_FORMAT_CONFIRM_MAGIC,
-    SdDiskKind, SdStatusReport, decode_frame, encode_frame,
+    AuxStatusReport, BoostMode, BoostStatusReport, BusStatusReport, KnockConfig, KnockStatusReport,
+    MAX_CHUNK_BYTES, MAX_FRAME_BYTES, NvmStatusReport, ProtoError, Request, Response,
+    SD_FORMAT_CONFIRM_MAGIC, SdDiskKind, SdStatusReport, decode_frame, encode_frame,
 };
 use proto_tunerstudio::{
     TS_FLAG_BURN_OK, TS_FLAG_OK, TS_OCH_SIZE, TS_PAGE_SIZE, TS_PROTO_VERSION, TS_SIGNATURE,
@@ -133,7 +133,50 @@ enum Commands {
         #[arg(long, default_value = "/dev/ttyACM0")]
         port: String,
     },
-    /// Persist active Knock DSP and Auxiliary I/O runtime configurations to SPI1 NVM
+    /// Query live Boost Control, overboost safety, Flex blend, 2-step launch, and FFS status
+    BoostStatus {
+        #[arg(long, default_value = "/dev/ttyACM0")]
+        port: String,
+    },
+    /// Update Boost Control, overboost safety, 2-step launch, or FFS parameters in RAM
+    BoostCfg {
+        #[arg(long, default_value = "/dev/ttyACM0")]
+        port: String,
+        /// `off`, `open`, or `closed`
+        #[arg(long)]
+        mode: Option<String>,
+        /// Uniform target MAP (`kPa`) applied across all 8 RPM bins
+        #[arg(long)]
+        target_kpa: Option<u16>,
+        /// Uniform base duty (`0..=1000` per-mille) applied across all 8 RPM bins
+        #[arg(long)]
+        base_duty: Option<u16>,
+        /// Warm overboost fuel/spark cut threshold (`kPa`)
+        #[arg(long)]
+        overboost_kpa: Option<f32>,
+        #[arg(long)]
+        overboost_enabled: Option<bool>,
+        #[arg(long)]
+        flex_comp_enabled: Option<bool>,
+        #[arg(long)]
+        flex_boost_kpa: Option<f32>,
+        #[arg(long)]
+        launch_enabled: Option<bool>,
+        #[arg(long)]
+        launch_rpm: Option<u16>,
+        #[arg(long)]
+        launch_retard_deg_x10: Option<i16>,
+        #[arg(long)]
+        ffs_enabled: Option<bool>,
+        #[arg(long)]
+        ffs_min_rpm: Option<u16>,
+        #[arg(long)]
+        lean_prot_enabled: Option<bool>,
+        /// Also persist active Knock + Aux + Boost configs to SPI1 Flash NVM after updating RAM
+        #[arg(long)]
+        burn: bool,
+    },
+    /// Persist active Knock DSP, Auxiliary I/O, and Boost configurations to SPI1 NVM
     BurnConfig {
         #[arg(long, default_value = "/dev/ttyACM0")]
         port: String,
@@ -587,6 +630,8 @@ fn format_fault_flags(faults: FaultFlags) -> String {
         (FaultFlags::VTP_OIL_PRESSURE, "VTP_OIL_PRESSURE"),
         (FaultFlags::KNOCK_SENSOR, "KNOCK_SENSOR"),
         (FaultFlags::WIDEBAND_FAULT, "WIDEBAND_FAULT"),
+        (FaultFlags::OVERBOOST_CUT, "OVERBOOST_CUT"),
+        (FaultFlags::LEAN_BOOST_CUT, "LEAN_BOOST_CUT"),
     ];
     flags
         .iter()
@@ -1388,6 +1433,142 @@ fn run_aux_status(port_path: &str) -> Result<()> {
     }
 }
 
+fn print_boost_status(report: &BoostStatusReport) {
+    let tel = &report.telemetry;
+    let cfg = &report.config;
+    println!("Boost, Safety & Launch Report");
+    println!("-----------------------------");
+    println!(
+        "Live Boost : mode={:?} | baro={:.1} kPa | boost={:+.1} kPa ({:+.1} psi) | \
+         target={:.1} kPa | peak={:+.1} kPa",
+        tel.mode,
+        tel.baro_kpa,
+        tel.boost_kpa,
+        tel.boost_kpa * 0.145_038,
+        tel.target_kpa,
+        tel.peak_boost_kpa
+    );
+    println!(
+        "Solenoid   : PE1/A19 duty={:.1}% (on={}) @ {} Hz | flex={:.3}x fuel / {:+.1} deg",
+        f32::from(tel.solenoid_duty_per_mille) / 10.0,
+        tel.solenoid_on,
+        cfg.solenoid_freq_hz,
+        tel.flex_fuel_mult,
+        tel.flex_spark_add_deg
+    );
+    println!(
+        "Safety     : overboost_cut={} ({:.0} kPa) | lean_cut={} | knock_drop={} | \
+         cold_limit={} | stft_neg_max={:.0} kPa",
+        tel.overboost_cut_active,
+        cfg.overboost_cut_kpa,
+        tel.lean_cut_active,
+        tel.knock_drop_active,
+        tel.cold_limit_active,
+        cfg.stft_max_map_kpa
+    );
+    println!(
+        "Motorsport : 2-step={} (en={}, {} RPM, {} deg/10) | FFS={} (en={}, min {} RPM)",
+        tel.launch_active,
+        cfg.launch_enabled,
+        cfg.launch_rpm,
+        cfg.launch_retard_deg_x10,
+        tel.ffs_active,
+        cfg.ffs_enabled,
+        cfg.ffs_min_rpm
+    );
+}
+
+fn run_boost_status(port_path: &str) -> Result<()> {
+    let mut port = open_serial(port_path)?;
+    match native_rpc(&mut port, &Request::GetBoostStatus)? {
+        Response::BoostStatus(report) => {
+            print_boost_status(&report);
+            Ok(())
+        }
+        Response::Error(err) => bail!("GetBoostStatus failed: {err:?}"),
+        other => bail!("unexpected GetBoostStatus response: {other:?}"),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_boost_cfg(
+    port_path: &str,
+    mode: Option<&str>,
+    target_kpa: Option<u16>,
+    base_duty: Option<u16>,
+    overboost_kpa: Option<f32>,
+    overboost_enabled: Option<bool>,
+    flex_comp_enabled: Option<bool>,
+    flex_boost_kpa: Option<f32>,
+    launch_enabled: Option<bool>,
+    launch_rpm: Option<u16>,
+    launch_retard_deg_x10: Option<i16>,
+    ffs_enabled: Option<bool>,
+    ffs_min_rpm: Option<u16>,
+    lean_prot_enabled: Option<bool>,
+    burn: bool,
+) -> Result<()> {
+    let mut port = open_serial(port_path)?;
+    let mut cfg = match native_rpc(&mut port, &Request::GetBoostStatus)? {
+        Response::BoostStatus(report) => report.config,
+        Response::Error(err) => bail!("GetBoostStatus failed: {err:?}"),
+        other => bail!("unexpected GetBoostStatus response: {other:?}"),
+    };
+    if let Some(m) = mode {
+        cfg.mode = match m.to_ascii_lowercase().as_str() {
+            "off" => BoostMode::Off,
+            "open" | "open_loop" => BoostMode::OpenLoop,
+            "closed" | "closed_loop" | "pid" => BoostMode::ClosedLoop,
+            _ => bail!("invalid boost mode '{m}'; expected off, open, or closed"),
+        };
+    }
+    if let Some(kpa) = target_kpa {
+        cfg.target_map_kpa = [kpa; 8];
+    }
+    if let Some(duty) = base_duty {
+        cfg.base_duty_per_mille = [duty; 8];
+    }
+    if let Some(v) = overboost_kpa {
+        cfg.overboost_cut_kpa = v;
+    }
+    if let Some(v) = overboost_enabled {
+        cfg.overboost_cut_enabled = v;
+    }
+    if let Some(v) = flex_comp_enabled {
+        cfg.flex_comp_enabled = v;
+    }
+    if let Some(v) = flex_boost_kpa {
+        cfg.flex_boost_adder_kpa = v;
+    }
+    if let Some(v) = launch_enabled {
+        cfg.launch_enabled = v;
+    }
+    if let Some(v) = launch_rpm {
+        cfg.launch_rpm = v;
+    }
+    if let Some(v) = launch_retard_deg_x10 {
+        cfg.launch_retard_deg_x10 = v;
+    }
+    if let Some(v) = ffs_enabled {
+        cfg.ffs_enabled = v;
+    }
+    if let Some(v) = ffs_min_rpm {
+        cfg.ffs_min_rpm = v;
+    }
+    if let Some(v) = lean_prot_enabled {
+        cfg.lean_prot_enabled = v;
+    }
+    match native_rpc(&mut port, &Request::SetBoostConfig { config: cfg })? {
+        Response::Ack => {}
+        Response::Error(err) => bail!("SetBoostConfig failed: {err:?}"),
+        other => bail!("unexpected SetBoostConfig response: {other:?}"),
+    }
+    if burn {
+        commit_runtime_cfg(&mut port)?;
+    }
+    run_boost_status(port_path)
+}
+
 fn format_rdid_hex(rdid: &[u8; 9], len: u8) -> String {
     let count = usize::from(len).min(rdid.len());
     if count == 0 {
@@ -1526,6 +1707,40 @@ fn main() -> Result<()> {
         ),
         Commands::ClearFaults { port } => run_clear_faults(&port),
         Commands::AuxStatus { port } => run_aux_status(&port),
+        Commands::BoostStatus { port } => run_boost_status(&port),
+        Commands::BoostCfg {
+            port,
+            mode,
+            target_kpa,
+            base_duty,
+            overboost_kpa,
+            overboost_enabled,
+            flex_comp_enabled,
+            flex_boost_kpa,
+            launch_enabled,
+            launch_rpm,
+            launch_retard_deg_x10,
+            ffs_enabled,
+            ffs_min_rpm,
+            lean_prot_enabled,
+            burn,
+        } => run_boost_cfg(
+            &port,
+            mode.as_deref(),
+            target_kpa,
+            base_duty,
+            overboost_kpa,
+            overboost_enabled,
+            flex_comp_enabled,
+            flex_boost_kpa,
+            launch_enabled,
+            launch_rpm,
+            launch_retard_deg_x10,
+            ffs_enabled,
+            ffs_min_rpm,
+            lean_prot_enabled,
+            burn,
+        ),
         Commands::BurnConfig { port } => run_burn_config(&port),
         Commands::NvmStatus { port } => run_nvm_status(&port),
         Commands::BusStatus { port } => run_bus_status(&port),
@@ -1558,7 +1773,11 @@ mod tests {
         let mut f = FaultFlags::default();
         f.insert(FaultFlags::MAP_RANGE);
         f.insert(FaultFlags::WIDEBAND_FAULT);
-        assert_eq!(format_fault_flags(f), "MAP_RANGE|WIDEBAND_FAULT");
+        f.insert(FaultFlags::OVERBOOST_CUT);
+        assert_eq!(
+            format_fault_flags(f),
+            "MAP_RANGE|WIDEBAND_FAULT|OVERBOOST_CUT"
+        );
 
         let cal = CalibrationBlob::default_honda_obd1();
         assert!(kpa_to_honda_map_adc(100.0, &cal) > kpa_to_honda_map_adc(30.0, &cal));

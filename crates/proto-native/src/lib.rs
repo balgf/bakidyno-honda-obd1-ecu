@@ -4,8 +4,10 @@
 //! shared by `firmware`, `ecu-cli`, and our future custom Rust `tuner-gui`.
 
 pub use ecu_types::{
-    AltfState, AuxIoConfig, AuxIoTelemetry, AuxOutputs, AuxSpareMode, FlexFuelState,
-    FlexSensorStatus, KnockConfig, KnockTelemetry, NvmMedium, NvmStatusReport, RuntimeConfigBlob,
+    AltfState, AuxIoConfig, AuxIoTelemetry, AuxOutputs, AuxSpareMode, BoostConfig, BoostMode,
+    BoostTelemetry, DiagStatusReport, FlexFuelState, FlexSensorStatus, KnockConfig, KnockTelemetry,
+    NvmMedium, NvmStatusReport, OutputEnableMask, OutputTestCommand, RUNTIME_CONFIG_MAGIC,
+    RUNTIME_CONFIG_VERSION, RuntimeConfigBlob,
 };
 use ecu_types::{TelemetrySnapshot, crc32};
 use heapless::Vec;
@@ -137,12 +139,28 @@ pub enum Request {
     SetAuxConfig {
         config: AuxIoConfig,
     },
-    /// Persists active RAM `KnockConfig` + `AuxIoConfig` into dedicated `SPI1` NVM slots.
+    /// Reads live boost controller, safety-cut, Flex blend, 2-step launch & FFS status.
+    GetBoostStatus,
+    /// Updates runtime turbo boost, safety-cut, 2-step launch & FFS configuration in RAM.
+    SetBoostConfig {
+        config: BoostConfig,
+    },
+    /// Persists active RAM `KnockConfig` + `AuxIoConfig` + `BoostConfig` into `SPI1` NVM slots.
     CommitRuntimeConfigToNvm,
     /// Reads detected `SPI1` NVM medium (`SpiNorFlash` vs `SpiFram`), RDID, capacity & slot info.
     GetNvmStatus,
     /// Reads live `FDCAN1` (`PD0`/`PD1`) and Honda `D7 DLC` (`PA9`/`PA10`) bus diagnostics.
     GetBusStatus,
+    /// Reads live ignition/injector enable mask, active output test state, and timer counters.
+    GetDiagStatus,
+    /// Updates volatile RAM ignition (`COP1..4`) and injector (`INJ1..4`) enable masks.
+    SetOutputEnableMask {
+        mask: OutputEnableMask,
+    },
+    /// Triggers or stops a Key-On Engine-Off (`RPM == 0`) spark, injector, tach, or pump test.
+    TriggerOutputTest {
+        cmd: OutputTestCommand,
+    },
 }
 
 /// Live Knock Window DSP config & telemetry snapshot returned by [`Request::GetKnockStatus`].
@@ -158,6 +176,14 @@ pub struct KnockStatusReport {
 pub struct AuxStatusReport {
     pub config: AuxIoConfig,
     pub telemetry: AuxIoTelemetry,
+}
+
+/// Live Boost Control, safety cut, 2-step launch, and flat-foot shift snapshot returned by
+/// [`Request::GetBoostStatus`].
+#[derive(Debug, Clone, Copy, PartialEq, Default, Serialize, Deserialize)]
+pub struct BoostStatusReport {
+    pub config: BoostConfig,
+    pub telemetry: BoostTelemetry,
 }
 
 /// Live `FDCAN1` (`PD0`/`PD1`) and Honda `D7 DLC` (`PA9`/`PA10`) status returned by
@@ -202,8 +228,10 @@ pub enum Response {
     },
     KnockStatus(KnockStatusReport),
     AuxStatus(AuxStatusReport),
+    BoostStatus(BoostStatusReport),
     NvmStatus(NvmStatusReport),
     BusStatus(BusStatusReport),
+    DiagStatus(DiagStatusReport),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -221,6 +249,7 @@ pub enum ProtoError {
     SdFormatRejectedEngineRunning,
     SdFileNotFound,
     SdIoFailed,
+    TestRejectedEngineRunning,
 }
 
 /// Pure `no_std` Consistent Overhead Byte Stuffing (`COBS`) encoder appending a `0x00` delimiter.
@@ -330,8 +359,16 @@ pub fn decode_frame<T: for<'de> Deserialize<'de>>(frame: &[u8]) -> Result<T, Pro
     postcard::from_bytes(&raw[..payload_len]).map_err(|_| ProtoError::DeserializeFailed)
 }
 
-/// Maximum serialized size of [`RuntimeConfigBlob`] persisted in `SPI1` NVM (`<= 256 B`).
-pub const MAX_RUNTIME_CONFIG_BYTES: usize = 256;
+/// Maximum serialized size of [`RuntimeConfigBlob`] persisted in `SPI1` NVM (`<= 1024 B`).
+pub const MAX_RUNTIME_CONFIG_BYTES: usize = 1_024;
+
+#[derive(Deserialize)]
+struct RuntimeConfigV1 {
+    magic: u32,
+    version: u16,
+    knock: KnockConfig,
+    aux: AuxIoConfig,
+}
 
 /// Serializes a [`RuntimeConfigBlob`] with `postcard` into `out`, returning written length.
 pub fn encode_runtime_config(cfg: &RuntimeConfigBlob, out: &mut [u8]) -> Result<usize, ProtoError> {
@@ -340,26 +377,39 @@ pub fn encode_runtime_config(cfg: &RuntimeConfigBlob, out: &mut [u8]) -> Result<
         .len())
 }
 
-/// Deserializes and header-validates a persisted [`RuntimeConfigBlob`].
+/// Deserializes and header-validates a persisted [`RuntimeConfigBlob`], transparently migrating
+/// legacy v1 blobs (`KnockConfig` + `AuxIoConfig`) with default [`BoostConfig`].
 pub fn decode_runtime_config(bytes: &[u8]) -> Option<RuntimeConfigBlob> {
-    let cfg: RuntimeConfigBlob = postcard::from_bytes(bytes).ok()?;
-    cfg.validate_header().then_some(cfg)
+    if let Ok(cfg) = postcard::from_bytes::<RuntimeConfigBlob>(bytes)
+        && cfg.validate_header()
+    {
+        return Some(cfg);
+    }
+    let v1: RuntimeConfigV1 = postcard::from_bytes(bytes).ok()?;
+    (v1.magic == RUNTIME_CONFIG_MAGIC && v1.version == 1).then_some(RuntimeConfigBlob {
+        magic: RUNTIME_CONFIG_MAGIC,
+        version: RUNTIME_CONFIG_VERSION,
+        knock: v1.knock,
+        aux: v1.aux,
+        boost: BoostConfig::default_honda_obd1(),
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use ecu_types::{
-        ActuatorOutputs, AuxIoConfig, AuxIoTelemetry, FaultFlags, KnockConfig, KnockTelemetry,
-        NvmMedium, NvmStatusReport, RuntimeConfigBlob, SensorSnapshot, SyncState,
-        TelemetrySnapshot, VtecState, WidebandState,
+        ActuatorOutputs, AuxIoConfig, AuxIoTelemetry, BoostConfig, BoostMode, BoostTelemetry,
+        FaultFlags, KnockConfig, KnockTelemetry, NvmMedium, NvmStatusReport, RuntimeConfigBlob,
+        SensorSnapshot, SyncState, TelemetrySnapshot, VtecState, WidebandState,
     };
     use heapless::Vec;
 
     use super::{
-        AuxStatusReport, BusStatusReport, KnockStatusReport, MAX_CHUNK_BYTES, MAX_FRAME_BYTES,
-        MAX_RUNTIME_CONFIG_BYTES, ProtoError, Request, Response, SD_FORMAT_CONFIRM_MAGIC,
-        SdDirEntry, SdDiskKind, SdStatusReport, cobs_decode, cobs_encode_with_delimiter,
-        decode_frame, decode_runtime_config, encode_frame, encode_runtime_config,
+        AuxStatusReport, BoostStatusReport, BusStatusReport, KnockStatusReport, MAX_CHUNK_BYTES,
+        MAX_FRAME_BYTES, MAX_RUNTIME_CONFIG_BYTES, ProtoError, Request, Response,
+        SD_FORMAT_CONFIRM_MAGIC, SdDirEntry, SdDiskKind, SdStatusReport, cobs_decode,
+        cobs_encode_with_delimiter, decode_frame, decode_runtime_config, encode_frame,
+        encode_runtime_config,
     };
 
     #[test]
@@ -566,8 +616,23 @@ mod tests {
         let mut rt_cfg = RuntimeConfigBlob::default_honda_obd1();
         rt_cfg.knock.center_freq_hz = 7_800;
         rt_cfg.aux.iab_engage_rpm = 5_900;
+        rt_cfg.boost.mode = BoostMode::ClosedLoop;
+        rt_cfg.boost.launch_enabled = true;
         let rt_len = encode_runtime_config(&rt_cfg, &mut rt_buf).expect("encode RuntimeConfigBlob");
         assert_eq!(decode_runtime_config(&rt_buf[..rt_len]), Some(rt_cfg));
+
+        let boost_req = Request::SetBoostConfig {
+            config: BoostConfig::default_honda_obd1(),
+        };
+        let blen = encode_frame(&boost_req, &mut wire).expect("encode SetBoostConfig");
+        assert_eq!(decode_frame::<Request>(&wire[..blen]), Ok(boost_req));
+
+        let boost_resp = Response::BoostStatus(BoostStatusReport {
+            config: BoostConfig::default_honda_obd1(),
+            telemetry: BoostTelemetry::new(),
+        });
+        let brlen = encode_frame(&boost_resp, &mut wire).expect("encode BoostStatus");
+        assert_eq!(decode_frame::<Response>(&wire[..brlen]), Ok(boost_resp));
 
         let nvm_req_len =
             encode_frame(&Request::GetNvmStatus, &mut wire).expect("encode GetNvmStatus");

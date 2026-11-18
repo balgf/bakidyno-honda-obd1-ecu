@@ -4,6 +4,7 @@
 
 use defmt::{info, warn};
 use ecu_core::aux_io::sanitize_aux_config;
+use ecu_core::boost::sanitize_boost_config;
 use ecu_types::{CalibrationBlob, RuntimeConfigBlob};
 use embassy_stm32::Peri;
 use embassy_stm32::interrupt::typelevel::Binding;
@@ -15,8 +16,9 @@ use embassy_usb::driver::EndpointError;
 use embassy_usb::{Builder, Config as UsbConfig, UsbDevice};
 use heapless::Vec;
 use proto_native::{
-    AuxStatusReport, BusStatusReport, KnockStatusReport, MAX_CHUNK_BYTES, ProtoError, Request,
-    Response, SD_FORMAT_CONFIRM_MAGIC, decode_frame, encode_frame,
+    AuxStatusReport, BoostStatusReport, BusStatusReport, KnockStatusReport, MAX_CHUNK_BYTES,
+    OutputTestCommand, ProtoError, Request, Response, SD_FORMAT_CONFIRM_MAGIC, decode_frame,
+    encode_frame,
 };
 use proto_tunerstudio::{
     TS_ERR_OUT_OF_RANGE, TS_FLAG_BURN_OK, TS_PAGE_SIZE, handle_ts_packet,
@@ -26,6 +28,7 @@ use static_cell::StaticCell;
 
 use crate::ECU_STATE;
 use crate::nvm::NvmStorage;
+use crate::outputs::HardwareOutputs;
 use crate::sd_logger_hw::{
     SdCmd, SdCmdReply, parse_rpc_filename, run_sd_command, set_rtc_datetime, status_report,
     trigger_mark_event, update_cal_crc,
@@ -515,12 +518,25 @@ async fn dispatch_native_request(
             );
             Response::Ack
         }
+        Request::GetBoostStatus => {
+            let state = ECU_STATE.lock().await;
+            Response::BoostStatus(BoostStatusReport {
+                config: state.ecu.boost_config(),
+                telemetry: state.ecu.boost_telemetry(),
+            })
+        }
+        Request::SetBoostConfig { config } => {
+            let sanitized = sanitize_boost_config(config);
+            ECU_STATE.lock().await.ecu.set_boost_config(sanitized);
+            Response::Ack
+        }
         Request::CommitRuntimeConfigToNvm => {
             let rt_cfg = {
                 let state = ECU_STATE.lock().await;
                 RuntimeConfigBlob {
                     knock: state.ecu.knock_config(),
                     aux: state.aux_cfg,
+                    boost: state.ecu.boost_config(),
                     ..RuntimeConfigBlob::default_honda_obd1()
                 }
             };
@@ -543,6 +559,49 @@ async fn dispatch_native_request(
                 can_tec: can_st.tec,
                 dlc_answered_frames: crate::dlc_hw::answered_frame_count(),
             })
+        }
+        Request::GetDiagStatus => {
+            let fp_ms = ECU_STATE.lock().await.ecu.fuel_pump_override_ms();
+            Response::DiagStatus(HardwareOutputs::diag_status(fp_ms))
+        }
+        Request::SetOutputEnableMask { mask } => {
+            HardwareOutputs::set_output_enable_mask(mask);
+            let fp_ms = {
+                let mut state = ECU_STATE.lock().await;
+                state.ecu.set_output_enable_mask(mask);
+                if let Some(ref cal) = state.cal {
+                    let targets = state.ecu.export_rt_targets(cal);
+                    crate::rt_trigger::update_targets(targets);
+                }
+                state.ecu.fuel_pump_override_ms()
+            };
+            Response::DiagStatus(HardwareOutputs::diag_status(fp_ms))
+        }
+        Request::TriggerOutputTest { cmd } => {
+            let (engine_running, mut fp_ms) = {
+                let mut state = ECU_STATE.lock().await;
+                let snap = state.ecu.snapshot();
+                let running = snap.rpm > 0 || snap.sync_state != ecu_types::SyncState::Unsynced;
+                match cmd {
+                    OutputTestCommand::StopAllTests => {
+                        state.ecu.set_fuel_pump_override_ms(0);
+                    }
+                    OutputTestCommand::FuelPumpPrime { duration_ms } if !running => {
+                        state
+                            .ecu
+                            .set_fuel_pump_override_ms(duration_ms.clamp(200, 10_000));
+                    }
+                    _ => {}
+                }
+                (running, state.ecu.fuel_pump_override_ms())
+            };
+            if !HardwareOutputs::start_output_test(cmd, engine_running) {
+                return Response::Error(ProtoError::TestRejectedEngineRunning);
+            }
+            if matches!(cmd, OutputTestCommand::StopAllTests) {
+                fp_ms = 0;
+            }
+            Response::DiagStatus(HardwareOutputs::diag_status(fp_ms))
         }
     }
 }

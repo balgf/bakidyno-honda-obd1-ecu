@@ -118,6 +118,8 @@ impl FaultFlags {
     pub const VTP_OIL_PRESSURE: u32 = 1 << 8; // Honda Code 22 (`D6` pressure timeout)
     pub const KNOCK_SENSOR: u32 = 1 << 9; // Honda Code 23
     pub const WIDEBAND_FAULT: u32 = 1 << 10; // Onboard LSU 4.9 fault
+    pub const OVERBOOST_CUT: u32 = 1 << 11; // Manifold pressure exceeded overboost cut limit
+    pub const LEAN_BOOST_CUT: u32 = 1 << 12; // Wideband reported lean AFR under boost
 
     #[inline]
     pub const fn is_empty(self) -> bool {
@@ -535,7 +537,7 @@ pub struct KnockTelemetry {
 /// Magic header identifying a valid persisted `RuntimeConfigBlob` (`"CIKA"`).
 pub const RUNTIME_CONFIG_MAGIC: u32 = 0x4349_4b41;
 /// Schema version for persisted [`RuntimeConfigBlob`].
-pub const RUNTIME_CONFIG_VERSION: u16 = 1;
+pub const RUNTIME_CONFIG_VERSION: u16 = 2;
 
 /// Operating mode for configurable spare low-side driver outputs (`PE0`, `PE1`).
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
@@ -551,6 +553,8 @@ pub enum AuxSpareMode {
     CoolantFanBackup { on_c: f32, off_c: f32 },
     /// Over-temperature warning lamp/solenoid latching above `warn_c` until `< clear_c`.
     OverTempWarning { warn_c: f32, clear_c: f32 },
+    /// Boost/pressure trigger (e.g., water-meth pump or dash indicator) latching above `on_kpa`.
+    BoostTrigger { on_kpa: f32, off_kpa: f32 },
 }
 
 /// Configuration parameters for Phase D.4 auxiliary outputs and frequency inputs.
@@ -768,14 +772,253 @@ pub struct AuxIoTelemetry {
     pub altf: AltfState,
 }
 
-/// Non-volatile runtime feature settings (`KnockConfig` + `AuxIoConfig`) stored independently of
-/// the TunerStudio `2,816`-byte calibration page.
+/// Operating mode for the `PE1` (`A19 BOOST`) electronic boost control solenoid driver.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+pub enum BoostMode {
+    /// Wastegate solenoid always off (`0%` duty -> mechanical wastegate spring pressure).
+    #[default]
+    Off,
+    /// Open-loop duty interpolated from `rpm_bins` / `base_duty_per_mille` and tapered by TPS.
+    OpenLoop,
+    /// Feedforward base duty + fast-spool assist + bounded PID targeting `MAP kPa`.
+    ClosedLoop,
+}
+
+/// Turbo boost control, overboost/lean-boost safety, Flex Fuel blend, 2-step launch, and
+/// flat-foot shift configuration (persisted in `RuntimeConfigBlob`).
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+pub struct BoostConfig {
+    /// Selects `PE1` (`A19 BOOST`) solenoid operation (`Off`, `OpenLoop`, or `ClosedLoop`).
+    pub mode: BoostMode,
+    /// Software PWM carrier frequency (`10..=60 Hz`; `30 Hz` nominal for MAC 3-port valves).
+    pub solenoid_freq_hz: u16,
+    /// Inverts `PE1` solenoid duty for normally-open pneumatic setups.
+    pub invert_solenoid: bool,
+    /// Minimum duty clamp (`0..=1000` per-mille).
+    pub min_duty_per_mille: u16,
+    /// Maximum duty clamp (`0..=1000` per-mille, default `900` = `90.0%`).
+    pub max_duty_per_mille: u16,
+    /// Fast-spool wastegate duty commanded when `MAP` lags target by > `spool_margin_kpa`.
+    pub spool_duty_per_mille: u16,
+    /// Target minus actual `MAP kPa` error above which fast-spool duty holds wastegate closed.
+    pub spool_margin_kpa: f32,
+    /// Minimum throttle (`%`) required for boost control above `0%` duty.
+    pub min_tps_pct: f32,
+    /// Throttle (`%`) above which 100% of mapped boost target / open-loop duty applies.
+    pub full_tps_pct: f32,
+    /// Minimum engine speed (`RPM`) for active boost control.
+    pub min_rpm: u16,
+    /// Minimum coolant temperature (`°C`) before electronic boost rises above spring pressure.
+    pub min_ect_c: f32,
+    /// Shared `8`-point RPM axis for `base_duty_per_mille` and `target_map_kpa`.
+    pub rpm_bins: [u16; 8],
+    /// Open-loop / closed-loop feedforward duty (`0..=1000` per-mille) across `rpm_bins`.
+    pub base_duty_per_mille: [u16; 8],
+    /// Closed-loop target absolute manifold pressure (`kPa`) across `rpm_bins`.
+    pub target_map_kpa: [u16; 8],
+    /// Closed-loop proportional gain × 100 (`per-mille / kPa`, `250` = `2.5%/kPa`).
+    pub pid_kp_x100: u16,
+    /// Closed-loop integral gain × 100 (`per-mille / (kPa·s)`, `180` = `1.8%/kPa·s`).
+    pub pid_ki_x100: u16,
+    /// Closed-loop derivative gain × 100 (`per-mille · s / kPa`).
+    pub pid_kd_x100: u16,
+    /// Symmetrical closed-loop PID correction authority around `base_duty` (`0..=600` per-mille).
+    pub pid_authority_per_mille: u16,
+
+    /// Applies `PE15` Continental Flex Fuel volume and timing compensation when sensor is `Valid`.
+    pub flex_comp_enabled: bool,
+    /// Additional target `MAP kPa` blended linearly from `E10 (0%)` to `E85+ (100%)`.
+    pub flex_boost_adder_kpa: f32,
+
+    /// Enables low-speed boost-by-speed ceiling using `B10 VSS` (`TIM2_CH4`) for FWD traction.
+    pub traction_boost_enabled: bool,
+    /// Vehicle speed (`km/h`) at or below which `traction_max_map_kpa` caps target boost.
+    pub traction_low_vss_kmh: f32,
+    /// Vehicle speed (`km/h`) above which full target boost unlocks linearly.
+    pub traction_high_vss_kmh: f32,
+    /// Maximum target `MAP kPa` allowed at `<= traction_low_vss_kmh`.
+    pub traction_max_map_kpa: f32,
+
+    /// Enables fuel + spark overboost protection cut (`FaultFlags::OVERBOOST_CUT`).
+    pub overboost_cut_enabled: bool,
+    /// Warm overboost cut threshold (`kPa` absolute, e.g., `250.0` = `~21.6 psi` gauge).
+    pub overboost_cut_kpa: f32,
+    /// Recovery hysteresis (`kPa`) below active cut threshold before restoring combustion.
+    pub overboost_hyst_kpa: f32,
+    /// Stricter overboost cut threshold (`kPa` absolute) when `ECT < min_ect_c`.
+    pub cold_overboost_cut_kpa: f32,
+
+    /// Drops boost solenoid to `0%` (spring pressure) when max knock retard >= threshold.
+    pub knock_drop_enabled: bool,
+    /// Maximum per-cylinder knock retard (`0.1°`, e.g., `35` = `3.5°`) triggering boost drop.
+    pub knock_drop_retard_deg_x10: i16,
+
+    /// Triggers safety cut and drops solenoid to `0%` if boosted AFR goes leaner than target.
+    pub lean_prot_enabled: bool,
+    /// Minimum `MAP kPa` above which lean-boost protection monitors wideband lambda.
+    pub lean_min_map_kpa: f32,
+    /// Maximum allowed positive lambda error (`λ_meas - λ_target`) under boost.
+    pub lean_max_lambda_err: f32,
+    /// Sustained lean duration (`ms`) required before latching `FaultFlags::LEAN_BOOST_CUT`.
+    pub lean_delay_ms: u16,
+    /// Maximum `MAP kPa` above which negative closed-loop STFT pull (`< 0%`) is inhibited.
+    pub stft_max_map_kpa: f32,
+
+    /// Enables 2-step launch control on `PE12` (`B7` clutch) below `launch_max_vss_kmh`.
+    pub launch_enabled: bool,
+    /// Target 2-step launch engine speed (`RPM`).
+    pub launch_rpm: u16,
+    /// Lead-in retard/cut ramp window below `launch_rpm`.
+    pub launch_window_rpm: u16,
+    /// Maximum stationary speed (`km/h`) eligible for 2-step launch (`> max` enters FFS logic).
+    pub launch_max_vss_kmh: f32,
+    /// Minimum throttle (`%`) required to arm 2-step launch.
+    pub launch_min_tps_pct: f32,
+    /// Spark advance commanded at `launch_rpm` (`0.1° BTDC`, negative = ATDC for anti-lag spool).
+    pub launch_retard_deg_x10: i16,
+    /// Additional fuel enrichment (`%`) applied while 2-step launch is active.
+    pub launch_fuel_enrich_pct: u8,
+    /// Minimum boost solenoid duty (`0..=1000` per-mille) held during active 2-step launch.
+    pub launch_boost_duty_per_mille: u16,
+
+    /// Enables WOT clutch flat-foot shift limiter above `launch_max_vss_kmh`.
+    pub ffs_enabled: bool,
+    /// Minimum RPM required to engage flat-foot shift on clutch press.
+    pub ffs_min_rpm: u16,
+    /// RPM subtracted from clutch-entry RPM to set the gear-change hold target.
+    pub ffs_rpm_drop: u16,
+    /// Minimum throttle (`%`) required for flat-foot shift activation.
+    pub ffs_min_tps_pct: f32,
+    /// Spark timing held during flat-foot shift (`0.1° BTDC`).
+    pub ffs_retard_deg_x10: i16,
+    /// Maximum continuous flat-foot shift duration (`ms`) per clutch press.
+    pub ffs_max_duration_ms: u16,
+}
+
+impl Default for BoostConfig {
+    fn default() -> Self {
+        Self::default_honda_obd1()
+    }
+}
+
+impl BoostConfig {
+    /// Conservative turbo baseline with overboost protection armed and wastegate solenoid off
+    /// until explicitly enabled by the tuner.
+    pub const fn default_honda_obd1() -> Self {
+        Self {
+            mode: BoostMode::Off,
+            solenoid_freq_hz: 30,
+            invert_solenoid: false,
+            min_duty_per_mille: 0,
+            max_duty_per_mille: 900,
+            spool_duty_per_mille: 900,
+            spool_margin_kpa: 25.0,
+            min_tps_pct: 25.0,
+            full_tps_pct: 80.0,
+            min_rpm: 1_500,
+            min_ect_c: 60.0,
+            rpm_bins: [2_500, 3_200, 4_000, 4_800, 5_600, 6_400, 7_200, 8_200],
+            base_duty_per_mille: [350, 380, 420, 450, 460, 470, 480, 480],
+            target_map_kpa: [155, 165, 170, 170, 170, 170, 165, 160],
+            pid_kp_x100: 250,
+            pid_ki_x100: 180,
+            pid_kd_x100: 20,
+            pid_authority_per_mille: 300,
+            flex_comp_enabled: true,
+            flex_boost_adder_kpa: 30.0,
+            traction_boost_enabled: false,
+            traction_low_vss_kmh: 35.0,
+            traction_high_vss_kmh: 75.0,
+            traction_max_map_kpa: 145.0,
+            overboost_cut_enabled: true,
+            overboost_cut_kpa: 250.0,
+            overboost_hyst_kpa: 15.0,
+            cold_overboost_cut_kpa: 165.0,
+            knock_drop_enabled: true,
+            knock_drop_retard_deg_x10: 35,
+            lean_prot_enabled: false,
+            lean_min_map_kpa: 145.0,
+            lean_max_lambda_err: 0.08,
+            lean_delay_ms: 150,
+            stft_max_map_kpa: 115.0,
+            launch_enabled: false,
+            launch_rpm: 4_500,
+            launch_window_rpm: 250,
+            launch_max_vss_kmh: 8.0,
+            launch_min_tps_pct: 50.0,
+            launch_retard_deg_x10: 0,
+            launch_fuel_enrich_pct: 10,
+            launch_boost_duty_per_mille: 500,
+            ffs_enabled: false,
+            ffs_min_rpm: 4_500,
+            ffs_rpm_drop: 400,
+            ffs_min_tps_pct: 80.0,
+            ffs_retard_deg_x10: 50,
+            ffs_max_duration_ms: 900,
+        }
+    }
+}
+
+/// Live turbo boost controller, safety cut, Flex trim, 2-step launch, and FFS telemetry.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+pub struct BoostTelemetry {
+    pub mode: BoostMode,
+    pub baro_kpa: f32,
+    pub boost_kpa: f32,
+    pub target_kpa: f32,
+    pub solenoid_duty_per_mille: u16,
+    pub solenoid_on: bool,
+    pub overboost_cut_active: bool,
+    pub lean_cut_active: bool,
+    pub knock_drop_active: bool,
+    pub cold_limit_active: bool,
+    pub launch_active: bool,
+    pub ffs_active: bool,
+    pub flex_fuel_mult: f32,
+    pub flex_spark_add_deg: f32,
+    pub peak_boost_kpa: f32,
+}
+
+impl Default for BoostTelemetry {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl BoostTelemetry {
+    pub const fn new() -> Self {
+        Self {
+            mode: BoostMode::Off,
+            baro_kpa: 101.3,
+            boost_kpa: 0.0,
+            target_kpa: 101.3,
+            solenoid_duty_per_mille: 0,
+            solenoid_on: false,
+            overboost_cut_active: false,
+            lean_cut_active: false,
+            knock_drop_active: false,
+            cold_limit_active: false,
+            launch_active: false,
+            ffs_active: false,
+            flex_fuel_mult: 1.0,
+            flex_spark_add_deg: 0.0,
+            peak_boost_kpa: 0.0,
+        }
+    }
+}
+
+/// Non-volatile runtime feature settings (`KnockConfig` + `AuxIoConfig` + `BoostConfig`) stored
+/// independently of the TunerStudio `2,816`-byte calibration page.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct RuntimeConfigBlob {
     pub magic: u32,
     pub version: u16,
     pub knock: KnockConfig,
     pub aux: AuxIoConfig,
+    pub boost: BoostConfig,
 }
 
 impl Default for RuntimeConfigBlob {
@@ -791,6 +1034,7 @@ impl RuntimeConfigBlob {
             version: RUNTIME_CONFIG_VERSION,
             knock: KnockConfig::default_honda_obd1(),
             aux: AuxIoConfig::default_honda_obd1(),
+            boost: BoostConfig::default_honda_obd1(),
         }
     }
 
@@ -830,6 +1074,108 @@ pub struct NvmStatusReport {
     pub cal_active_seq: u32,
     pub cfg_active_slot: Option<u8>,
     pub cfg_active_seq: u32,
+}
+
+/// Runtime enable/disable mask for sequential ignition (`COP1..4`) and fuel injectors (`INJ1..4`).
+///
+/// Stored strictly in volatile RAM (never written to NVM) so an ECU reset or power-cycle always
+/// restores all 4 cylinders enabled.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+pub struct OutputEnableMask {
+    /// Master ignition enable (`false` = cuts all 4 Smart COP channels `PE9/PE11/PE13/PE14`).
+    pub ignition_enabled: bool,
+    /// Per-cylinder ignition enable (`[Cyl1, Cyl2, Cyl3, Cyl4]`).
+    pub cop_cyl_enabled: [bool; 4],
+    /// Master fuel injector enable (`false` = cuts all 4 injector channels `PC6/PC7/PB0/PB1`).
+    pub injectors_enabled: bool,
+    /// Per-cylinder fuel injector enable (`[Cyl1, Cyl2, Cyl3, Cyl4]`).
+    pub inj_cyl_enabled: [bool; 4],
+}
+
+impl Default for OutputEnableMask {
+    fn default() -> Self {
+        Self::all_enabled()
+    }
+}
+
+impl OutputEnableMask {
+    /// Returns a mask with master and per-cylinder ignition and injectors all enabled.
+    pub const fn all_enabled() -> Self {
+        Self {
+            ignition_enabled: true,
+            cop_cyl_enabled: [true; 4],
+            injectors_enabled: true,
+            inj_cyl_enabled: [true; 4],
+        }
+    }
+
+    /// Returns `true` if Smart COP ignition is enabled for `cyl`.
+    #[inline]
+    pub const fn is_cop_enabled(self, cyl: Cylinder) -> bool {
+        self.ignition_enabled && self.cop_cyl_enabled[cyl.index()]
+    }
+
+    /// Returns `true` if fuel injection is enabled for `cyl`.
+    #[inline]
+    pub const fn is_inj_enabled(self, cyl: Cylinder) -> bool {
+        self.injectors_enabled && self.inj_cyl_enabled[cyl.index()]
+    }
+
+    /// Returns `true` if any master or per-cylinder ignition/injector cut is currently active.
+    #[inline]
+    pub const fn any_cut_active(self) -> bool {
+        !self.ignition_enabled
+            || !self.injectors_enabled
+            || !self.cop_cyl_enabled[0]
+            || !self.cop_cyl_enabled[1]
+            || !self.cop_cyl_enabled[2]
+            || !self.cop_cyl_enabled[3]
+            || !self.inj_cyl_enabled[0]
+            || !self.inj_cyl_enabled[1]
+            || !self.inj_cyl_enabled[2]
+            || !self.inj_cyl_enabled[3]
+    }
+}
+
+/// Key-On Engine-Off (`RPM == 0`) diagnostic output test command.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+pub enum OutputTestCommand {
+    /// Immediately stops any active diagnostic output test sequence.
+    StopAllTests,
+    /// Pulses a single Smart COP channel (`PE9/PE11/PE13/PE14`) + `PB8 TACH_OUT` at `RPM == 0`.
+    SparkTest {
+        cylinder: Cylinder,
+        pulse_count: u8,
+        period_ms: u16,
+        dwell_us: u16,
+    },
+    /// Pulses a single sequential fuel injector (`PC6/PC7/PB0/PB1`) at `RPM == 0`.
+    InjectorTest {
+        cylinder: Cylinder,
+        pulse_count: u8,
+        period_ms: u16,
+        pulse_width_us: u16,
+    },
+    /// Pulses `PB8 TACH_OUT` (`TIM16` `1.2 ms` one-pulse) at `RPM == 0` to verify cluster tach.
+    TachSweep { pulse_count: u8, period_ms: u16 },
+    /// Energizes `PD3` (`A7/A8 FLR` Main Relay fuel pump) for `duration_ms` while `RPM == 0`.
+    FuelPumpPrime { duration_ms: u16 },
+}
+
+/// Live ignition/injector enable mask, active test progress, and hardware timer counters.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+pub struct DiagStatusReport {
+    pub enable_mask: OutputEnableMask,
+    pub test_active: bool,
+    pub pulses_remaining: u8,
+    pub fuel_pump_override_ms: u16,
+    pub spark_fire_count: u32,
+    pub inj_pulse_count: u32,
+    pub tach_pulse_count: u32,
+    pub cop_watchdog_count: u32,
 }
 
 /// Computes IEEE 802.3 CRC-32 over an arbitrary byte slice.

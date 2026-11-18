@@ -151,6 +151,18 @@ impl FuelModel {
         self.tooth_scheduler.reset_cycle();
     }
 
+    /// Looks up the target lambda (`0.65..=1.25`) from the RPM × MAP target table.
+    pub fn lookup_target_lambda(&self, rpm: u16, map_kpa: f32, cal: &CalibrationBlob) -> f32 {
+        (interp_2d_u16(
+            &cal.rpm_bins,
+            &cal.map_kpa_bins,
+            &cal.target_lambda_x1000,
+            rpm as f32,
+            map_kpa,
+        ) * 0.001)
+            .clamp(0.65, 1.25)
+    }
+
     pub fn compute_1khz(
         &mut self,
         rpm: u16,
@@ -160,8 +172,35 @@ impl FuelModel {
         measured_lambda: f32,
         cal: &CalibrationBlob,
     ) -> FuelOutput {
-        // 1. Hard rev-limiter fuel cut (protects valvetrain!)
-        if rpm >= cal.rev_limit_hard_rpm {
+        self.compute_1khz_with_trims(
+            rpm,
+            use_vtec_map,
+            sensors,
+            wbo_state,
+            measured_lambda,
+            cal,
+            1.0,
+            true,
+            false,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn compute_1khz_with_trims(
+        &mut self,
+        rpm: u16,
+        use_vtec_map: bool,
+        sensors: &SensorSnapshot,
+        wbo_state: WidebandState,
+        measured_lambda: f32,
+        cal: &CalibrationBlob,
+        fuel_multiplier: f32,
+        allow_negative_stft: bool,
+        hard_cut_all: bool,
+    ) -> FuelOutput {
+        // 1. Hard rev-limiter or turbo safety cut (overboost / lean-boost) cuts all injectors!
+        if hard_cut_all || rpm >= cal.rev_limit_hard_rpm {
+            self.stft_pi.reset();
             return FuelOutput {
                 ve_pct: 0.0,
                 target_lambda: 1.0,
@@ -217,14 +256,7 @@ impl FuelModel {
             sensors.map_kpa,
         ) * 0.1;
 
-        let target_lambda = (interp_2d_u16(
-            &cal.rpm_bins,
-            &cal.map_kpa_bins,
-            &cal.target_lambda_x1000,
-            rpm as f32,
-            sensors.map_kpa,
-        ) * 0.001)
-            .clamp(0.70, 1.25);
+        let target_lambda = self.lookup_target_lambda(rpm, sensors.map_kpa, cal);
 
         let v_cyl_m3 = (cal.displacement_cc as f32 / 4.0) * 1e-6;
         let p_pa = sensors.map_kpa * 1_000.0;
@@ -260,6 +292,9 @@ impl FuelModel {
         }
 
         // 7. Closed-Loop Bosch LSU 4.9 Short-Term Fuel Trim (`ECT >= 60 °C` & not in fuel cut)
+        //    When boosted above `stft_max_map_kpa`, disallow negative STFT fuel pulls (`< 0%`)
+        //    so exhaust/wideband noise can never lean out high boost.
+        self.stft_pi.out_min = if allow_negative_stft { -25.0 } else { 0.0 };
         let stft_pct = if wbo_state == WidebandState::ClosedLoopReady && sensors.ect_c >= 60.0 {
             // Positive error when measured exhaust is leaner (`λ_meas > λ_target`) -> add fuel!
             let lambda_err = measured_lambda - target_lambda;
@@ -269,9 +304,10 @@ impl FuelModel {
             0.0
         };
         let stft_mult = 1.0 + (stft_pct * 0.01);
+        let safe_mult = fuel_multiplier.clamp(0.80, 2.20);
 
         let effective_pw_us =
-            (base_pw_us * warmup_mult * stft_mult) + self.accel_enrich_us + deadtime_us;
+            (base_pw_us * warmup_mult * safe_mult * stft_mult) + self.accel_enrich_us + deadtime_us;
         let clamped_pw = effective_pw_us.clamp(0.0, 60_000.0) as u32;
 
         // Soft rev-limit cuts 2 alternating cylinders (`Cyl2` & `Cyl3`) before hard cut

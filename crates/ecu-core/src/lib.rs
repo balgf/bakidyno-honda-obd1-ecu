@@ -6,6 +6,7 @@
 //! and `thumbv7em-none-eabihf` (`Cortex-M7F`) bare-metal firmware.
 
 pub mod aux_io;
+pub mod boost;
 pub mod can_bus;
 pub mod datalog;
 pub mod dlc;

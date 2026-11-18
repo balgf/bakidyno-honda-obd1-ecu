@@ -448,6 +448,17 @@ fn eval_spare_mode(
             }
             *latched
         }
+        AuxSpareMode::BoostTrigger { on_kpa, off_kpa } => {
+            let low_kpa = off_kpa.min(on_kpa);
+            if *latched {
+                if sensors.map_kpa <= low_kpa {
+                    *latched = false;
+                }
+            } else if sensors.map_kpa >= on_kpa {
+                *latched = true;
+            }
+            *latched
+        }
     }
 }
 
@@ -645,5 +656,47 @@ mod tests {
         assert!(!t2.outputs.iab_on);
         assert!(!t2.outputs.pe0_on);
         assert!(t2.outputs.pe1_on);
+
+        // BoostTrigger hysteresis on PE0 (on >= 140 kPa, stays latched at 130 kPa, off <= 125 kPa)
+        cfg.pe0_mode = AuxSpareMode::BoostTrigger {
+            on_kpa: 140.0,
+            off_kpa: 125.0,
+        };
+        let b1 = ctrl.update_1khz(
+            4_500,
+            &SensorSnapshot {
+                map_kpa: 145.0,
+                ..sns
+            },
+            true,
+            None,
+            None,
+            &cfg,
+        );
+        assert!(b1.outputs.pe0_on);
+        let b2 = ctrl.update_1khz(
+            4_500,
+            &SensorSnapshot {
+                map_kpa: 130.0,
+                ..sns
+            },
+            true,
+            None,
+            None,
+            &cfg,
+        );
+        assert!(b2.outputs.pe0_on);
+        let b3 = ctrl.update_1khz(
+            4_500,
+            &SensorSnapshot {
+                map_kpa: 120.0,
+                ..sns
+            },
+            true,
+            None,
+            None,
+            &cfg,
+        );
+        assert!(!b3.outputs.pe0_on);
     }
 }

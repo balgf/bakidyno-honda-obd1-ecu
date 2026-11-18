@@ -1,5 +1,6 @@
 //! Top-level ECU coordinator orchestrating `1 kHz` control ticks and hard real-time tooth edges.
 
+use crate::boost::{BoostController, sanitize_boost_config};
 use crate::fuel::{FuelModel, FuelToothScheduler, InjScheduleBatch};
 use crate::ignition::{IgnitionModel, IgnitionToothScheduler, ToothScheduleBatch};
 use crate::knock::{KnockDetector, KnockWindowPlan, plan_knock_window_on_ckp_tooth};
@@ -9,8 +10,9 @@ use crate::trigger::{CkpToothEvent, HondaObd1Decoder};
 use crate::vtec::VtecController;
 use crate::wideband::Lsu49Controller;
 use ecu_types::{
-    ActuatorOutputs, CalibrationBlob, Cylinder, FaultFlags, KnockConfig, KnockTelemetry,
-    RawSensorAdc, SensorSnapshot, SwitchState, SyncState, TelemetrySnapshot,
+    ActuatorOutputs, BoostConfig, BoostTelemetry, CalibrationBlob, Cylinder, FaultFlags,
+    FlexFuelState, KnockConfig, KnockTelemetry, OutputEnableMask, RawSensorAdc, SensorSnapshot,
+    SwitchState, SyncState, TelemetrySnapshot,
 };
 
 /// Combined ignition & injector compare actions emitted on a single `CKP` tooth edge.
@@ -31,6 +33,7 @@ pub struct RtControlTargets {
     pub per_cyl_knock_retard_deg_x10: [i16; 4],
     pub inj_pw_us: [u32; 4],
     pub knock_config: KnockConfig,
+    pub output_mask: OutputEnableMask,
 }
 
 impl Default for RtControlTargets {
@@ -49,6 +52,7 @@ impl RtControlTargets {
             per_cyl_knock_retard_deg_x10: [0; 4],
             inj_pw_us: [0; 4],
             knock_config: KnockConfig::default_honda_obd1(),
+            output_mask: OutputEnableMask::all_enabled(),
         }
     }
 }
@@ -124,15 +128,15 @@ impl RtTriggerEngine {
             &mut self.trigger_faults,
         ) {
             self.last_angle_deg_x10 = ev.crank_angle_deg_x10;
-            let cop = self.ignition_tooth.schedule_on_ckp_tooth(
+            let cop = self.ignition_tooth.schedule_on_ckp_tooth_masked(
                 &ev,
                 self.targets.spark_advance_deg_x10,
                 &self.targets.per_cyl_knock_retard_deg_x10,
                 self.targets.cop_dwell_us,
+                self.targets.output_mask,
             );
-            let inj = self
-                .fuel_tooth
-                .schedule_on_ckp_tooth(&ev, &self.targets.inj_pw_us);
+            let masked_inj_pw = apply_inj_mask(self.targets.inj_pw_us, self.targets.output_mask);
+            let inj = self.fuel_tooth.schedule_on_ckp_tooth(&ev, &masked_inj_pw);
             let knock = plan_knock_window_on_ckp_tooth(&self.targets.knock_config, &ev);
             (
                 ToothScheduleOutputs {
@@ -180,12 +184,18 @@ pub struct EngineCoordinator {
     pub fuel: FuelModel,
     pub ignition: IgnitionModel,
     pub knock: KnockDetector,
+    pub boost: BoostController,
 
     uptime_ms: u32,
     seq: u32,
     last_angle_deg_x10: u16,
     fan_on_latched: bool,
     timing_override_deg_x10: Option<i16>,
+    output_mask: OutputEnableMask,
+    runtime_cut_mask: OutputEnableMask,
+    fuel_pump_override_ms: u16,
+    boost_cfg: BoostConfig,
+    flex_state: FlexFuelState,
 
     latest_sensors: SensorSnapshot,
     latest_actuators: ActuatorOutputs,
@@ -212,11 +222,17 @@ impl EngineCoordinator {
             fuel: FuelModel::new(),
             ignition: IgnitionModel::new(),
             knock: KnockDetector::new(),
+            boost: BoostController::new(),
             uptime_ms: 0,
             seq: 0,
             last_angle_deg_x10: 0,
             fan_on_latched: false,
             timing_override_deg_x10: None,
+            output_mask: OutputEnableMask::all_enabled(),
+            runtime_cut_mask: OutputEnableMask::all_enabled(),
+            fuel_pump_override_ms: 0,
+            boost_cfg: BoostConfig::default_honda_obd1(),
+            flex_state: FlexFuelState::new(),
             latest_sensors: SensorSnapshot {
                 map_kpa: 100.0,
                 tps_pct: 0.0,
@@ -262,11 +278,60 @@ impl EngineCoordinator {
         self.timing_override_deg_x10 = override_deg_x10;
     }
 
+    #[inline]
+    pub const fn output_enable_mask(&self) -> OutputEnableMask {
+        self.output_mask
+    }
+
+    #[inline]
+    pub const fn effective_output_mask(&self) -> OutputEnableMask {
+        combine_masks(self.output_mask, self.runtime_cut_mask)
+    }
+
+    #[inline]
+    pub fn set_output_enable_mask(&mut self, mask: OutputEnableMask) {
+        self.output_mask = mask;
+        let eff = self.effective_output_mask();
+        self.latest_actuators.inj_pw_us = apply_inj_mask(self.latest_actuators.inj_pw_us, eff);
+        self.last_computed_inj_pw_us = apply_inj_mask(self.last_computed_inj_pw_us, eff);
+    }
+
+    #[inline]
+    pub fn set_boost_config(&mut self, cfg: BoostConfig) {
+        self.boost_cfg = sanitize_boost_config(cfg);
+    }
+
+    #[inline]
+    pub const fn boost_config(&self) -> BoostConfig {
+        self.boost_cfg
+    }
+
+    #[inline]
+    pub const fn boost_telemetry(&self) -> BoostTelemetry {
+        self.boost.telemetry()
+    }
+
+    #[inline]
+    pub fn set_flex_state(&mut self, flex: FlexFuelState) {
+        self.flex_state = flex;
+    }
+
+    #[inline]
+    pub const fn fuel_pump_override_ms(&self) -> u16 {
+        self.fuel_pump_override_ms
+    }
+
+    #[inline]
+    pub fn set_fuel_pump_override_ms(&mut self, duration_ms: u16) {
+        self.fuel_pump_override_ms = duration_ms;
+    }
+
     /// Clears latched RAM MIL flags without bypassing active safety lockouts.
     #[inline]
     pub fn clear_faults(&mut self) {
         self.latest_faults = FaultFlags(0);
         self.sensors_proc.reset_fault_counters();
+        self.boost.reset_peak_hold();
     }
 
     #[inline]
@@ -314,14 +379,15 @@ impl EngineCoordinator {
             &mut self.latest_faults,
         ) {
             self.last_angle_deg_x10 = ev.crank_angle_deg_x10;
-            let cop = self.ignition.schedule_on_ckp_tooth(
+            let eff_mask = self.effective_output_mask();
+            let cop = self.ignition.schedule_on_ckp_tooth_masked(
                 &ev,
                 self.latest_actuators.spark_advance_deg_x10,
                 self.latest_actuators.cop_dwell_us,
+                eff_mask,
             );
-            let inj = self
-                .fuel
-                .schedule_on_ckp_tooth(&ev, &self.latest_actuators.inj_pw_us);
+            let masked_inj_pw = apply_inj_mask(self.latest_actuators.inj_pw_us, eff_mask);
+            let inj = self.fuel.schedule_on_ckp_tooth(&ev, &masked_inj_pw);
             ToothScheduleOutputs {
                 event: Some(ev),
                 cop,
@@ -357,6 +423,7 @@ impl EngineCoordinator {
             per_cyl_knock_retard_deg_x10: self.ignition.per_cyl_knock_retard_deg_x10(),
             inj_pw_us: self.last_computed_inj_pw_us,
             knock_config: self.knock.config(),
+            output_mask: self.effective_output_mask(),
         }
     }
 
@@ -408,20 +475,61 @@ impl EngineCoordinator {
             &mut self.latest_faults,
         );
 
-        // 4. Speed-Density Fuel + Closed-Loop Wideband STFT
-        let fuel_out = self.fuel.compute_1khz(
+        // 4. Knock DSP 1 kHz Decay/Fault Update (evaluated before Boost knock-drop safety)
+        let engine_unsynced = self.trigger.sync_state() == SyncState::Unsynced;
+        self.knock
+            .tick_1khz(engine_unsynced, &mut self.latest_faults);
+        let max_knock_retard = self
+            .knock
+            .per_cyl_retard_deg_x10()
+            .into_iter()
+            .max()
+            .unwrap_or(0);
+
+        // 5. Turbo Boost Control, Overboost/Lean-Boost Safety, Flex Trims, 2-Step & FFS
+        let table_target_lambda = self.fuel.lookup_target_lambda(rpm, sensors.map_kpa, cal);
+        let boost_out = self.boost.update_1khz(
+            self.trigger.sync_state(),
+            rpm,
+            &sensors,
+            &self.flex_state,
+            max_knock_retard,
+            self.wideband.state(),
+            self.wideband.lambda(),
+            table_target_lambda,
+            &mut self.latest_faults,
+            &self.boost_cfg,
+        );
+        self.runtime_cut_mask = if boost_out.hard_cut_all {
+            OutputEnableMask {
+                ignition_enabled: false,
+                cop_cyl_enabled: [false; 4],
+                injectors_enabled: false,
+                inj_cyl_enabled: [false; 4],
+            }
+        } else {
+            OutputEnableMask {
+                ignition_enabled: true,
+                cop_cyl_enabled: boost_out.cyl_spark_enabled,
+                injectors_enabled: true,
+                inj_cyl_enabled: [true; 4],
+            }
+        };
+
+        // 6. Speed-Density Fuel + Flex/Launch Multipliers + Wideband STFT Guard
+        let fuel_out = self.fuel.compute_1khz_with_trims(
             rpm,
             use_vtec_maps,
             &sensors,
             self.wideband.state(),
             self.wideband.lambda(),
             cal,
+            boost_out.fuel_multiplier,
+            boost_out.allow_negative_stft,
+            boost_out.hard_cut_all,
         );
 
-        // 5. Knock DSP 1 kHz Decay/Fault Update + Ignition Advance + Smart COP Dwell
-        let engine_unsynced = self.trigger.sync_state() == SyncState::Unsynced;
-        self.knock
-            .tick_1khz(engine_unsynced, &mut self.latest_faults);
+        // 7. Ignition Advance (Flex Octane + Launch/FFS Blended Retard + Thermal/Knock)
         let suppress_knock_retard =
             switches.scs_service_jumper || self.timing_override_deg_x10.is_some();
         self.ignition
@@ -430,19 +538,28 @@ impl EngineCoordinator {
             } else {
                 self.knock.per_cyl_retard_deg_x10()
             });
-        let (spark_advance_deg_x10, cop_dwell_us) = self.ignition.compute_1khz(
+        let (spark_advance_deg_x10, cop_dwell_us) = self.ignition.compute_1khz_with_trims(
             rpm,
             use_vtec_maps,
             &sensors,
             self.timing_override_deg_x10,
+            boost_out.flex_spark_add_deg_x10,
+            boost_out.spark_blend_target,
             cal,
         );
 
         // 6. Auxiliary Honda OBD1 Connector A Relays & IACV
         // `A7/A8 FLR`: Prime fuel pump for 2.0 s at key-on, then hold ON whenever engine is
-        // turning or cranking!
-        let fuel_pump_relay_on =
-            self.uptime_ms <= 2_000 || rpm > 0 || sensors.switches.sts_cranking;
+        // turning or cranking (or during a KOEO fuel-pump test prime)!
+        if rpm > 0 {
+            self.fuel_pump_override_ms = 0;
+        } else if self.fuel_pump_override_ms > 0 {
+            self.fuel_pump_override_ms = self.fuel_pump_override_ms.saturating_sub(1);
+        }
+        let fuel_pump_relay_on = self.uptime_ms <= 2_000
+            || rpm > 0
+            || sensors.switches.sts_cranking
+            || self.fuel_pump_override_ms > 0;
 
         // `A12 FANC*`: Radiator fan hysteresis
         if sensors.ect_c >= cal.fan_on_ect_c as f32 {
@@ -484,11 +601,13 @@ impl EngineCoordinator {
             false
         };
 
+        let eff_mask = self.effective_output_mask();
+        let masked_pw_us = apply_inj_mask(fuel_out.final_pw_us, eff_mask);
         let actuators = ActuatorOutputs {
             inj_pw_us: if self.trigger.sync_state() == SyncState::Unsynced {
                 [0; 4]
             } else {
-                fuel_out.final_pw_us
+                masked_pw_us
             },
             spark_advance_deg_x10,
             cop_dwell_us,
@@ -504,7 +623,7 @@ impl EngineCoordinator {
 
         self.latest_sensors = sensors;
         self.latest_actuators = actuators;
-        self.last_computed_inj_pw_us = fuel_out.final_pw_us;
+        self.last_computed_inj_pw_us = masked_pw_us;
         self.latest_ve_pct = fuel_out.ve_pct;
         self.latest_target_lambda = fuel_out.target_lambda;
         self.latest_stft_pct = fuel_out.stft_pct;
@@ -533,6 +652,44 @@ impl EngineCoordinator {
             faults: self.latest_faults,
         }
     }
+}
+
+#[inline]
+const fn combine_masks(
+    user_mask: OutputEnableMask,
+    runtime_mask: OutputEnableMask,
+) -> OutputEnableMask {
+    OutputEnableMask {
+        ignition_enabled: user_mask.ignition_enabled && runtime_mask.ignition_enabled,
+        cop_cyl_enabled: [
+            user_mask.cop_cyl_enabled[0] && runtime_mask.cop_cyl_enabled[0],
+            user_mask.cop_cyl_enabled[1] && runtime_mask.cop_cyl_enabled[1],
+            user_mask.cop_cyl_enabled[2] && runtime_mask.cop_cyl_enabled[2],
+            user_mask.cop_cyl_enabled[3] && runtime_mask.cop_cyl_enabled[3],
+        ],
+        injectors_enabled: user_mask.injectors_enabled && runtime_mask.injectors_enabled,
+        inj_cyl_enabled: [
+            user_mask.inj_cyl_enabled[0] && runtime_mask.inj_cyl_enabled[0],
+            user_mask.inj_cyl_enabled[1] && runtime_mask.inj_cyl_enabled[1],
+            user_mask.inj_cyl_enabled[2] && runtime_mask.inj_cyl_enabled[2],
+            user_mask.inj_cyl_enabled[3] && runtime_mask.inj_cyl_enabled[3],
+        ],
+    }
+}
+
+#[inline]
+const fn apply_inj_mask(mut pw_us: [u32; 4], mask: OutputEnableMask) -> [u32; 4] {
+    if !mask.injectors_enabled {
+        return [0; 4];
+    }
+    let mut i = 0;
+    while i < 4 {
+        if !mask.inj_cyl_enabled[i] {
+            pw_us[i] = 0;
+        }
+        i += 1;
+    }
+    pw_us
 }
 
 #[cfg(test)]
@@ -862,5 +1019,162 @@ mod tests {
             ecu.snapshot().vtec_state,
             ecu_types::VtecState::FaultLockout
         );
+    }
+
+    #[test]
+    fn output_enable_mask_cuts_individual_and_global_spark_and_fuel() {
+        let cal = CalibrationBlob::default_honda_obd1();
+        let mut ecu = EngineCoordinator::new();
+        let mut mask = ecu_types::OutputEnableMask::all_enabled();
+        mask.cop_cyl_enabled[1] = false; // Cut Cyl 2 spark
+        mask.inj_cyl_enabled[2] = false; // Cut Cyl 3 injector
+        ecu.set_output_enable_mask(mask);
+
+        let cruise_adc = nominal_raw_adc(0.55, 1.20);
+        let mut ts = 100_000u32;
+        let dt_us = 1_667u32;
+        let _ = ecu.on_ckp_capture(ts, &cal);
+        let mut sparks = [0u32; 4];
+        let mut injs = [0u32; 4];
+
+        for cycle in 0..2 {
+            for tooth in 0..24u8 {
+                if tooth == 0 {
+                    ecu.on_cyp_capture(ts + 40);
+                }
+                if tooth.is_multiple_of(6) {
+                    ecu.on_tdc_capture(ts + 80);
+                }
+                ts += dt_us;
+                let out = ecu.on_ckp_capture(ts, &cal);
+                if cycle == 1 {
+                    for act in out.cop.actions.iter().flatten() {
+                        if !act.drive_dwell_high {
+                            sparks[act.cylinder.index()] += 1;
+                        }
+                    }
+                    for act in out.inj.actions.iter().flatten() {
+                        injs[act.cylinder.index()] += 1;
+                    }
+                }
+                let _ = ecu.tick_1khz(ts, &cruise_adc, SwitchState::default(), 50.0, false, &cal);
+            }
+        }
+
+        assert_eq!(sparks, [1, 0, 1, 1]);
+        assert_eq!(injs, [1, 1, 0, 1]);
+        assert_eq!(ecu.snapshot().actuators.inj_pw_us[2], 0);
+        assert!(ecu.snapshot().actuators.inj_pw_us[0] > 0);
+    }
+
+    #[test]
+    fn turbo_boost_flex_two_step_and_overboost_cut_work_end_to_end() {
+        use ecu_types::{BoostConfig, BoostMode, FlexFuelState, FlexSensorStatus, MapSensorCal};
+
+        let mut cal = CalibrationBlob::default_honda_obd1();
+        cal.map_cal = MapSensorCal {
+            kpa_at_0v: 0.0,
+            kpa_at_5v: 400.0,
+        };
+        let mut boost_cfg = BoostConfig::default_honda_obd1();
+        boost_cfg.mode = BoostMode::ClosedLoop;
+        boost_cfg.overboost_cut_kpa = 230.0;
+        boost_cfg.overboost_hyst_kpa = 20.0;
+        boost_cfg.launch_enabled = true;
+        boost_cfg.launch_rpm = 4_500;
+        boost_cfg.launch_window_rpm = 300;
+        boost_cfg.launch_retard_deg_x10 = -30;
+
+        let mut ecu = EngineCoordinator::new();
+        ecu.set_boost_config(boost_cfg);
+
+        // Helper for 4-bar MAP raw ADC
+        let make_4bar_adc = |kpa: f32, tps_v: f32| RawSensorAdc {
+            map_raw: volts_5v_to_adc((kpa / 400.0) * 5.0),
+            ..nominal_raw_adc(0.45, tps_v)
+        };
+
+        // Sync up at ~4,600 RPM (dt_us = 1087 us per 30° tooth)
+        let mut ts = 100_000u32;
+        let dt_us = 1_087u32;
+        let boost_adc = make_4bar_adc(140.0, 4.20);
+        let _ = ecu.on_ckp_capture(ts, &cal);
+        for cycle in 0..2 {
+            for tooth in 0..24u8 {
+                if tooth == 0 {
+                    ecu.on_cyp_capture(ts + 40);
+                }
+                if tooth.is_multiple_of(6) {
+                    ecu.on_tdc_capture(ts + 80);
+                }
+                ts += dt_us;
+                let _ = ecu.on_ckp_capture(ts, &cal);
+                let _ = ecu.tick_1khz(ts, &boost_adc, SwitchState::default(), 60.0, false, &cal);
+            }
+            if cycle == 0 {
+                assert_eq!(ecu.snapshot().sync_state, SyncState::FullSynced720);
+            }
+        }
+
+        // 1. E85 Flex Fuel increases pulsewidth (~1.41x) and advances spark (+4.0 deg)
+        let e0_act = ecu.tick_1khz(
+            ts + 1_000,
+            &boost_adc,
+            SwitchState::default(),
+            60.0,
+            false,
+            &cal,
+        );
+        ecu.set_flex_state(FlexFuelState {
+            status: FlexSensorStatus::Valid,
+            freq_hz: 135.0,
+            ethanol_pct: 85.0,
+            fuel_temp_c: 25.0,
+            age_ms: 0,
+        });
+        let e85_act = ecu.tick_1khz(
+            ts + 2_000,
+            &boost_adc,
+            SwitchState::default(),
+            60.0,
+            false,
+            &cal,
+        );
+        assert!(e85_act.inj_pw_us[0] > e0_act.inj_pw_us[0] + 1_500);
+        assert!(e85_act.spark_advance_deg_x10 >= e0_act.spark_advance_deg_x10 + 35);
+
+        // 2. Stationary + clutch pressed enables 2-step launch retard & rotating spark cut
+        let clutch_sw = SwitchState {
+            clutch_pressed: true,
+            ..Default::default()
+        };
+        let launch_act = ecu.tick_1khz(ts + 3_000, &boost_adc, clutch_sw, 0.0, false, &cal);
+        assert!(ecu.boost_telemetry().launch_active);
+        assert_eq!(launch_act.spark_advance_deg_x10, -30);
+        assert!(
+            ecu.effective_output_mask()
+                .cop_cyl_enabled
+                .iter()
+                .any(|&c| !c)
+        );
+
+        // 3. Overboost > 230 kPa cuts all fuel + spark and sets FaultFlags::OVERBOOST_CUT
+        let over_adc = make_4bar_adc(245.0, 4.20);
+        let mut cut_act = launch_act;
+        for i in 0..10u32 {
+            cut_act = ecu.tick_1khz(
+                ts + (4 + i) * 1_000,
+                &over_adc,
+                SwitchState::default(),
+                80.0,
+                false,
+                &cal,
+            );
+        }
+        assert_eq!(cut_act.inj_pw_us, [0; 4]);
+        assert!(!ecu.effective_output_mask().ignition_enabled);
+        assert!(!ecu.effective_output_mask().injectors_enabled);
+        assert!(ecu.snapshot().faults.contains(FaultFlags::OVERBOOST_CUT));
+        assert_eq!(ecu.boost_telemetry().solenoid_duty_per_mille, 0);
     }
 }

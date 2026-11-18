@@ -258,6 +258,7 @@ async fn main(spawner: Spawner) {
     {
         let mut state = ECU_STATE.lock().await;
         state.ecu.set_knock_config(rt_cfg.knock);
+        state.ecu.set_boost_config(rt_cfg.boost);
         knock_hw::set_hw_enabled(state.ecu.knock_config().enabled);
         state.aux_cfg = aux_cfg;
         let targets = state.ecu.export_rt_targets(&cal);
@@ -355,6 +356,7 @@ async fn main(spawner: Spawner) {
             let mut state = ECU_STATE.lock().await;
             let state_ref = &mut *state;
             state_ref.ecu.apply_rt_status(rt_status);
+            state_ref.ecu.set_flex_state(state_ref.aux.snapshot().flex);
             let Some(ref cal) = state_ref.cal else {
                 continue;
             };
@@ -367,7 +369,7 @@ async fn main(spawner: Spawner) {
                 cal,
             );
             let snap = state_ref.ecu.snapshot();
-            let aux_snap = state_ref.aux.update_1khz(
+            let mut aux_snap = state_ref.aux.update_1khz(
                 snap.rpm,
                 &snap.sensors,
                 snap.wideband_state == WidebandState::ClosedLoopReady,
@@ -375,13 +377,19 @@ async fn main(spawner: Spawner) {
                 altf_sample,
                 &state_ref.aux_cfg,
             );
+            let boost_tel = state_ref.ecu.boost_telemetry();
+            if boost_tel.mode != ecu_types::BoostMode::Off {
+                aux_snap.outputs.pe1_on = boost_tel.solenoid_on;
+            }
             state_ref.aux_telemetry = aux_snap;
             let rt_targets = state_ref.ecu.export_rt_targets(cal);
             (out, snap, aux_snap, snap.faults.is_empty(), rt_targets)
         };
         rt_trigger::update_targets(rt_targets);
 
-        HardwareOutputs::enforce_safety(snap.sync_state == SyncState::FullSynced720);
+        let full_synced = snap.sync_state == SyncState::FullSynced720;
+        HardwareOutputs::tick_1khz_diag(full_synced, snap.rpm);
+        HardwareOutputs::enforce_safety(full_synced);
         hw_outputs.set_iacv_duty_per_mille(out.iacv_duty_per_mille);
 
         vts_high_en.set_level(Level::from(out.vts_high_side_on));
