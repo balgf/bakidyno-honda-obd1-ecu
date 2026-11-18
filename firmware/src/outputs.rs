@@ -13,6 +13,7 @@ use critical_section::CriticalSection;
 use defmt::warn;
 use ecu_core::fuel::InjScheduleBatch;
 use ecu_core::ignition::ToothScheduleBatch;
+use ecu_types::{Cylinder, DiagStatusReport, OutputEnableMask, OutputTestCommand};
 use embassy_stm32::Peri;
 use embassy_stm32::gpio::OutputType;
 use embassy_stm32::interrupt::typelevel;
@@ -75,6 +76,28 @@ static INJ_SLOTS: Mutex<CriticalSectionRawMutex, RefCell<[InjSlot; 4]>> = Mutex:
         off_target_tim2_us: 0,
     }; 4],
 ));
+
+#[derive(Clone, Copy)]
+struct DiagTestState {
+    active_cmd: Option<OutputTestCommand>,
+    pulses_remaining: u8,
+    cooldown_ms: u16,
+    mask: OutputEnableMask,
+}
+
+impl DiagTestState {
+    const fn new() -> Self {
+        Self {
+            active_cmd: None,
+            pulses_remaining: 0,
+            cooldown_ms: 0,
+            mask: OutputEnableMask::all_enabled(),
+        }
+    }
+}
+
+static DIAG_STATE: Mutex<CriticalSectionRawMutex, RefCell<DiagTestState>> =
+    Mutex::new(RefCell::new(DiagTestState::new()));
 
 static SPARK_FIRE_COUNT: AtomicU32 = AtomicU32::new(0);
 static INJ_PULSE_COUNT: AtomicU32 = AtomicU32::new(0);
@@ -401,9 +424,248 @@ impl<'d> HardwareOutputs<'d> {
         inj_batch: &InjScheduleBatch,
     ) {
         critical_section::with(|cs| {
-            Self::schedule_cop_inner(cs, ckp_ts_us, cop_batch);
-            Self::schedule_inj_inner(cs, ckp_ts_us, inj_batch);
+            let mask = {
+                let mut diag = DIAG_STATE.borrow(cs).borrow_mut();
+                diag.active_cmd = None;
+                diag.pulses_remaining = 0;
+                diag.cooldown_ms = 0;
+                diag.mask
+            };
+            Self::schedule_cop_inner(cs, ckp_ts_us, cop_batch, mask);
+            Self::schedule_inj_inner(cs, ckp_ts_us, inj_batch, mask);
         });
+    }
+
+    /// Updates the volatile RAM ignition & injector enable mask and immediately de-energizes any
+    /// newly disabled channels.
+    pub fn set_output_enable_mask(mask: OutputEnableMask) {
+        critical_section::with(|cs| {
+            DIAG_STATE.borrow(cs).borrow_mut().mask = mask;
+            let t1 = tim1_gp16();
+            let mut cop_slots = COP_SLOTS.borrow(cs).borrow_mut();
+            let t3 = tim3_gp16();
+            let mut inj_slots = INJ_SLOTS.borrow(cs).borrow_mut();
+            let cyls = [
+                Cylinder::Cyl1,
+                Cylinder::Cyl2,
+                Cylinder::Cyl3,
+                Cylinder::Cyl4,
+            ];
+            for (ch, cyl) in cyls.into_iter().enumerate() {
+                if !mask.is_cop_enabled(cyl) {
+                    cop_slots[ch].dwell_high = false;
+                    cop_slots[ch].pending_spark_tim2_us = None;
+                    force_channel_off(t1, ch);
+                }
+                if !mask.is_inj_enabled(cyl) {
+                    inj_slots[ch].phase = InjPhase::Closed;
+                    force_channel_off(t3, ch);
+                }
+            }
+        });
+    }
+
+    /// Starts or stops a Key-On Engine-Off (`RPM == 0`) diagnostic output test sequence.
+    pub fn start_output_test(cmd: OutputTestCommand, engine_running: bool) -> bool {
+        if matches!(cmd, OutputTestCommand::StopAllTests) {
+            critical_section::with(|cs| {
+                let mut diag = DIAG_STATE.borrow(cs).borrow_mut();
+                diag.active_cmd = None;
+                diag.pulses_remaining = 0;
+                diag.cooldown_ms = 0;
+                if !engine_running {
+                    let t1 = tim1_gp16();
+                    let mut cop_slots = COP_SLOTS.borrow(cs).borrow_mut();
+                    for (ch, slot) in cop_slots.iter_mut().enumerate() {
+                        slot.dwell_high = false;
+                        slot.pending_spark_tim2_us = None;
+                        force_channel_off(t1, ch);
+                    }
+                    let t3 = tim3_gp16();
+                    let mut inj_slots = INJ_SLOTS.borrow(cs).borrow_mut();
+                    for (ch, slot) in inj_slots.iter_mut().enumerate() {
+                        slot.phase = InjPhase::Closed;
+                        force_channel_off(t3, ch);
+                    }
+                }
+            });
+            return true;
+        }
+        if engine_running {
+            return false;
+        }
+
+        critical_section::with(|cs| {
+            let mut diag = DIAG_STATE.borrow(cs).borrow_mut();
+            match cmd {
+                OutputTestCommand::SparkTest {
+                    cylinder,
+                    pulse_count,
+                    period_ms,
+                    dwell_us,
+                } => {
+                    let count = pulse_count.clamp(1, 20);
+                    let period = period_ms.clamp(50, 1_000);
+                    let dwell = dwell_us.clamp(500, 6_000);
+                    diag.active_cmd = Some(OutputTestCommand::SparkTest {
+                        cylinder,
+                        pulse_count: count,
+                        period_ms: period,
+                        dwell_us: dwell,
+                    });
+                    diag.pulses_remaining = count;
+                    diag.cooldown_ms = 0;
+                }
+                OutputTestCommand::InjectorTest {
+                    cylinder,
+                    pulse_count,
+                    period_ms,
+                    pulse_width_us,
+                } => {
+                    let count = pulse_count.clamp(1, 20);
+                    let period = period_ms.clamp(50, 1_000);
+                    let pw = pulse_width_us.clamp(500, 25_000);
+                    diag.active_cmd = Some(OutputTestCommand::InjectorTest {
+                        cylinder,
+                        pulse_count: count,
+                        period_ms: period,
+                        pulse_width_us: pw,
+                    });
+                    diag.pulses_remaining = count;
+                    diag.cooldown_ms = 0;
+                }
+                OutputTestCommand::TachSweep {
+                    pulse_count,
+                    period_ms,
+                } => {
+                    let count = pulse_count.clamp(1, 50);
+                    let period = period_ms.clamp(10, 500);
+                    diag.active_cmd = Some(OutputTestCommand::TachSweep {
+                        pulse_count: count,
+                        period_ms: period,
+                    });
+                    diag.pulses_remaining = count;
+                    diag.cooldown_ms = 0;
+                }
+                OutputTestCommand::FuelPumpPrime { .. } | OutputTestCommand::StopAllTests => {
+                    diag.active_cmd = None;
+                    diag.pulses_remaining = 0;
+                    diag.cooldown_ms = 0;
+                }
+            }
+        });
+        true
+    }
+
+    /// Advances any active `RPM == 0` diagnostic pulse test once per `1 ms` control tick.
+    pub fn tick_1khz_diag(synced: bool, rpm: u16) {
+        critical_section::with(|cs| {
+            let mut diag = DIAG_STATE.borrow(cs).borrow_mut();
+            if synced || rpm > 0 {
+                diag.active_cmd = None;
+                diag.pulses_remaining = 0;
+                diag.cooldown_ms = 0;
+                return;
+            }
+            let Some(cmd) = diag.active_cmd else {
+                return;
+            };
+            if diag.cooldown_ms > 0 {
+                diag.cooldown_ms -= 1;
+                return;
+            }
+            if diag.pulses_remaining == 0 {
+                let cop_busy = COP_SLOTS
+                    .borrow(cs)
+                    .borrow()
+                    .iter()
+                    .any(|s| s.dwell_high || s.pending_spark_tim2_us.is_some());
+                let inj_busy = INJ_SLOTS
+                    .borrow(cs)
+                    .borrow()
+                    .iter()
+                    .any(|s| s.phase != InjPhase::Closed);
+                if !cop_busy && !inj_busy {
+                    diag.active_cmd = None;
+                }
+                return;
+            }
+
+            let now_tim2 = pac::TIM2.cnt().read();
+            match cmd {
+                OutputTestCommand::SparkTest {
+                    cylinder,
+                    period_ms,
+                    dwell_us,
+                    ..
+                } => {
+                    let ch = cylinder.index();
+                    let t1 = tim1_gp16();
+                    let mut cop_slots = COP_SLOTS.borrow(cs).borrow_mut();
+                    let slot = &mut cop_slots[ch];
+                    if !slot.dwell_high {
+                        let start_us = now_tim2.wrapping_add(10);
+                        let spark_us = start_us.wrapping_add(u32::from(dwell_us));
+                        slot.pending_spark_tim2_us = Some(spark_us);
+                        arm_channel_at_tim2_us(t1, ch, start_us, OcmGp::ACTIVE_ON_MATCH);
+                    }
+                    diag.pulses_remaining -= 1;
+                    diag.cooldown_ms = period_ms;
+                }
+                OutputTestCommand::InjectorTest {
+                    cylinder,
+                    period_ms,
+                    pulse_width_us,
+                    ..
+                } => {
+                    let ch = cylinder.index();
+                    let t3 = tim3_gp16();
+                    let mut inj_slots = INJ_SLOTS.borrow(cs).borrow_mut();
+                    let slot = &mut inj_slots[ch];
+                    if slot.phase == InjPhase::Closed {
+                        let on_us = now_tim2.wrapping_add(10);
+                        slot.off_target_tim2_us = on_us.wrapping_add(u32::from(pulse_width_us));
+                        slot.phase = InjPhase::WaitOpen;
+                        arm_channel_at_tim2_us(t3, ch, on_us, OcmGp::ACTIVE_ON_MATCH);
+                    }
+                    diag.pulses_remaining -= 1;
+                    diag.cooldown_ms = period_ms;
+                }
+                OutputTestCommand::TachSweep { period_ms, .. } => {
+                    trigger_tach_one_pulse();
+                    diag.pulses_remaining -= 1;
+                    diag.cooldown_ms = period_ms;
+                }
+                OutputTestCommand::FuelPumpPrime { .. } | OutputTestCommand::StopAllTests => {
+                    diag.active_cmd = None;
+                    diag.pulses_remaining = 0;
+                }
+            }
+        });
+    }
+
+    /// Returns a snapshot of the current output enable mask, active test progress, and timer counts.
+    pub fn diag_status(fuel_pump_override_ms: u16) -> DiagStatusReport {
+        let (enable_mask, test_active, pulses_remaining) = critical_section::with(|cs| {
+            let diag = DIAG_STATE.borrow(cs).borrow();
+            (
+                diag.mask,
+                diag.active_cmd.is_some() || fuel_pump_override_ms > 0,
+                diag.pulses_remaining,
+            )
+        });
+        let (spark_fire_count, inj_pulse_count, tach_pulse_count, cop_watchdog_count) =
+            Self::telemetry_counts();
+        DiagStatusReport {
+            enable_mask,
+            test_active,
+            pulses_remaining,
+            fuel_pump_override_ms,
+            spark_fire_count,
+            inj_pulse_count,
+            tach_pulse_count,
+            cop_watchdog_count,
+        }
     }
 
     /// Enforces coil dwell safety watchdog and forces outputs off when `Unsynced` / stalled.
@@ -412,6 +674,16 @@ impl<'d> HardwareOutputs<'d> {
             // Read `TIM2->CNT` *inside* the critical section so a pre-empting `TIM1_CC` ISR cannot
             // update `dwell_started_tim2_us` to a timestamp slightly newer than `now_tim2_us`.
             let now_tim2_us = pac::TIM2.cnt().read();
+            let (test_active, mask) = {
+                let diag = DIAG_STATE.borrow(cs).borrow();
+                (diag.active_cmd.is_some(), diag.mask)
+            };
+            let cyls = [
+                Cylinder::Cyl1,
+                Cylinder::Cyl2,
+                Cylinder::Cyl3,
+                Cylinder::Cyl4,
+            ];
             let t1 = tim1_gp16();
             let mut cop_slots = COP_SLOTS.borrow(cs).borrow_mut();
             for (ch, slot) in cop_slots.iter_mut().enumerate() {
@@ -421,17 +693,19 @@ impl<'d> HardwareOutputs<'d> {
                     COP_WD_COUNT.fetch_add(1, Ordering::Relaxed);
                     warn!("COP WD ch={} elapsed={}us", ch, elapsed_us);
                 }
-                if !synced || over_dwell {
+                let cut_by_mask = synced && !mask.is_cop_enabled(cyls[ch]);
+                if (!synced && !test_active) || over_dwell || cut_by_mask {
                     slot.dwell_high = false;
                     slot.pending_spark_tim2_us = None;
                     force_channel_off(t1, ch);
                 }
             }
 
-            if !synced {
-                let t3 = tim3_gp16();
-                let mut inj_slots = INJ_SLOTS.borrow(cs).borrow_mut();
-                for (ch, slot) in inj_slots.iter_mut().enumerate() {
+            let t3 = tim3_gp16();
+            let mut inj_slots = INJ_SLOTS.borrow(cs).borrow_mut();
+            for (ch, slot) in inj_slots.iter_mut().enumerate() {
+                let cut_by_mask = synced && !mask.is_inj_enabled(cyls[ch]);
+                if (!synced && !test_active) || cut_by_mask {
                     slot.phase = InjPhase::Closed;
                     force_channel_off(t3, ch);
                 }
@@ -449,11 +723,19 @@ impl<'d> HardwareOutputs<'d> {
         )
     }
 
-    fn schedule_cop_inner(cs: CriticalSection<'_>, ckp_ts_us: u32, batch: &ToothScheduleBatch) {
+    fn schedule_cop_inner(
+        cs: CriticalSection<'_>,
+        ckp_ts_us: u32,
+        batch: &ToothScheduleBatch,
+        mask: OutputEnableMask,
+    ) {
         let regs = tim1_gp16();
         let mut slots = COP_SLOTS.borrow(cs).borrow_mut();
 
         for act in batch.actions.iter().flatten() {
+            if !mask.is_cop_enabled(act.cylinder) {
+                continue;
+            }
             let ch = act.cylinder.index();
             let slot = &mut slots[ch];
             let target_us = ckp_ts_us.wrapping_add(act.delay_from_tooth_us as u32);
@@ -475,12 +757,17 @@ impl<'d> HardwareOutputs<'d> {
         }
     }
 
-    fn schedule_inj_inner(cs: CriticalSection<'_>, ckp_ts_us: u32, batch: &InjScheduleBatch) {
+    fn schedule_inj_inner(
+        cs: CriticalSection<'_>,
+        ckp_ts_us: u32,
+        batch: &InjScheduleBatch,
+        mask: OutputEnableMask,
+    ) {
         let regs = tim3_gp16();
         let mut slots = INJ_SLOTS.borrow(cs).borrow_mut();
 
         for act in batch.actions.iter().flatten() {
-            if act.pulse_width_us == 0 {
+            if act.pulse_width_us == 0 || !mask.is_inj_enabled(act.cylinder) {
                 continue;
             }
             let ch = act.cylinder.index();
