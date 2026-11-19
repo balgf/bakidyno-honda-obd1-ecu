@@ -316,7 +316,15 @@ impl<'d> NvmStorage<'d> {
                 Some(req) => len == req,
                 None => len > 0 && len <= scratch.len(),
             };
-            if hdr.schema_version != region.schema_version || !len_ok {
+            let version_ok = match id {
+                RegionId::Calibration => hdr.schema_version == region.schema_version,
+                // Allow legacy v1/v2 runtime config slots to migrate losslessly via
+                // `decode_runtime_config`.
+                RegionId::RuntimeConfig => {
+                    (1..=region.schema_version).contains(&hdr.schema_version)
+                }
+            };
+            if !version_ok || !len_ok {
                 continue;
             }
             if self

@@ -182,6 +182,7 @@ impl FuelModel {
             1.0,
             true,
             false,
+            false,
         )
     }
 
@@ -196,6 +197,7 @@ impl FuelModel {
         cal: &CalibrationBlob,
         fuel_multiplier: f32,
         allow_negative_stft: bool,
+        suppress_stft: bool,
         hard_cut_all: bool,
     ) -> FuelOutput {
         // 1. Hard rev-limiter or turbo safety cut (overboost / lean-boost) cuts all injectors!
@@ -291,11 +293,16 @@ impl FuelModel {
             }
         }
 
-        // 7. Closed-Loop Bosch LSU 4.9 Short-Term Fuel Trim (`ECT >= 60 °C` & not in fuel cut)
-        //    When boosted above `stft_max_map_kpa`, disallow negative STFT fuel pulls (`< 0%`)
-        //    so exhaust/wideband noise can never lean out high boost.
+        // 7. Closed-Loop Bosch LSU 4.9 Short-Term Fuel Trim (`ECT >= 60 °C` & not in any cut).
+        //    When boosted above `stft_max_map_kpa`, disallow negative STFT fuel pulls (`< 0%`).
+        //    During soft rev-limit or 2-step/FFS spark cuts, freeze/reset STFT so unburned oxygen
+        //    does not wind STFT up to +25%.
         self.stft_pi.out_min = if allow_negative_stft { -25.0 } else { 0.0 };
-        let stft_pct = if wbo_state == WidebandState::ClosedLoopReady && sensors.ect_c >= 60.0 {
+        let cut_in_progress = suppress_stft || rpm >= cal.rev_limit_soft_rpm;
+        let stft_pct = if !cut_in_progress
+            && wbo_state == WidebandState::ClosedLoopReady
+            && sensors.ect_c >= 60.0
+        {
             // Positive error when measured exhaust is leaner (`λ_meas > λ_target`) -> add fuel!
             let lambda_err = measured_lambda - target_lambda;
             self.stft_pi.update(lambda_err, 0.001)
@@ -558,19 +565,36 @@ mod tests {
         );
         assert_eq!(cold_cruise.stft_pct, 0.0);
 
-        // 4. Soft rev limit (7,350 RPM) cuts Cyl2 & Cyl3; Hard rev limit (7,500 RPM) cuts all 4
+        // 4. Soft rev limit (7,350 RPM) cuts Cyl2 & Cyl3 and resets/freezes STFT even if wideband
+        //    reports unburned-oxygen lean spike (λ = 1.60); Hard rev limit (7,500 RPM) cuts all 4.
         let soft = fuel.compute_1khz(
             7_350,
             true,
             &warm_sns,
             WidebandState::ClosedLoopReady,
-            1.0,
+            1.60,
             &cal,
         );
         assert!(soft.final_pw_us[0] > 0);
         assert_eq!(soft.final_pw_us[1], 0);
         assert_eq!(soft.final_pw_us[2], 0);
         assert!(soft.final_pw_us[3] > 0);
+        assert_eq!(soft.stft_pct, 0.0);
+
+        // 5. Explicit `suppress_stft` (e.g. 2-step launch / FFS) also freezes STFT at 0%.
+        let suppressed = fuel.compute_1khz_with_trims(
+            4_600,
+            false,
+            &warm_sns,
+            WidebandState::ClosedLoopReady,
+            1.60,
+            &cal,
+            1.0,
+            true,
+            true,
+            false,
+        );
+        assert_eq!(suppressed.stft_pct, 0.0);
 
         let hard = fuel.compute_1khz(
             7_500,

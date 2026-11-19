@@ -163,24 +163,22 @@ pub struct LogMarkButton {
 }
 
 impl LogMarkButton {
-    /// Auto-detects external pull polarity on `PC13` (`KEY`) so both WeAct active-high (`10 kΩ`
-    /// pull-down to GND, button -> `3.3V`) and active-low clones read deterministically.
+    /// Auto-detects external pull polarity on `PC13` (`KEY` / Stage 2 `SW_MARK`) so WeAct
+    /// active-high boards (`10 kΩ` external pull-down, button -> `3.3V`), active-low external
+    /// pull-up clones, and the Stage 2 PCB (button directly to `GND`, no external resistor) all
+    /// read deterministically.
     pub fn init(pc13: Peri<'static, PC13>) -> Self {
         let mut flex = Flex::new(pc13);
-        flex.set_as_input(Pull::Down);
-        for _ in 0..1_000 {
-            cortex_m::asm::nop();
-        }
-        let down_high = flex.is_high();
-
         flex.set_as_input(Pull::Up);
         for _ in 0..1_000 {
             cortex_m::asm::nop();
         }
         let up_high = flex.is_high();
 
-        // External strong pull-up keeps pin HIGH even under internal Pull::Down -> active-low key.
-        let (pull, active_high) = if down_high && up_high {
+        // WeAct's 10 kΩ external pull-down overpowers STM32's ~40 kΩ internal pull-up (`up_high` is
+        // false) -> active-high key. External pull-up clones and Stage 2 PCB (no external pull,
+        // button shorts to GND) both read `up_high == true` -> internal `Pull::Up` active-low key!
+        let (pull, active_high) = if up_high {
             (Pull::Up, false)
         } else {
             (Pull::Down, true)

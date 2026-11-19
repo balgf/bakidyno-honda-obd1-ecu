@@ -172,6 +172,9 @@ enum Commands {
         ffs_min_rpm: Option<u16>,
         #[arg(long)]
         lean_prot_enabled: Option<bool>,
+        /// Invert `B7 CLUTCH` polarity (`true` for NC Honda upper cruise clutch switch)
+        #[arg(long)]
+        clutch_invert: Option<bool>,
         /// Also persist active Knock + Aux + Boost configs to SPI1 Flash NVM after updating RAM
         #[arg(long)]
         burn: bool,
@@ -1479,14 +1482,16 @@ fn print_boost_status(report: &BoostStatusReport) {
         cfg.stft_max_map_kpa
     );
     println!(
-        "Motorsport : 2-step={} (en={}, {} RPM, {} deg/10) | FFS={} (en={}, min {} RPM)",
+        "Motorsport : 2-step={} (en={}, {} RPM, {} deg/10) | FFS={} (en={}, min {} RPM) | \
+         clutch_inv={}",
         tel.launch_active,
         cfg.launch_enabled,
         cfg.launch_rpm,
         cfg.launch_retard_deg_x10,
         tel.ffs_active,
         cfg.ffs_enabled,
-        cfg.ffs_min_rpm
+        cfg.ffs_min_rpm,
+        cfg.clutch_invert
     );
 }
 
@@ -1518,6 +1523,7 @@ fn run_boost_cfg(
     ffs_enabled: Option<bool>,
     ffs_min_rpm: Option<u16>,
     lean_prot_enabled: Option<bool>,
+    clutch_invert: Option<bool>,
     burn: bool,
 ) -> Result<()> {
     let mut port = open_serial(port_path)?;
@@ -1569,6 +1575,9 @@ fn run_boost_cfg(
     }
     if let Some(v) = lean_prot_enabled {
         cfg.lean_prot_enabled = v;
+    }
+    if let Some(v) = clutch_invert {
+        cfg.clutch_invert = v;
     }
     match native_rpc(&mut port, &Request::SetBoostConfig { config: cfg })? {
         Response::Ack => {}
@@ -1735,6 +1744,7 @@ fn main() -> Result<()> {
             ffs_enabled,
             ffs_min_rpm,
             lean_prot_enabled,
+            clutch_invert,
             burn,
         } => run_boost_cfg(
             &port,
@@ -1751,6 +1761,7 @@ fn main() -> Result<()> {
             ffs_enabled,
             ffs_min_rpm,
             lean_prot_enabled,
+            clutch_invert,
             burn,
         ),
         Commands::BurnConfig { port } => run_burn_config(&port),

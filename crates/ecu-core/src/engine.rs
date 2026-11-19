@@ -176,6 +176,167 @@ impl RtTriggerEngine {
     }
 }
 
+/// Classic Honda OBD1 2-digit MIL blink codes in ascending order (`D4 SCS` diagnostic mode).
+const MIL_CODE_TABLE: [(u32, u8); 13] = [
+    (FaultFlags::MAP_RANGE, 3),
+    (FaultFlags::CKP_SYNC_LOSS, 4),
+    (FaultFlags::ECT_RANGE, 6),
+    (FaultFlags::TPS_RANGE, 7),
+    (FaultFlags::TDC_SENSOR, 8),
+    (FaultFlags::CYP_SENSOR, 9),
+    (FaultFlags::IAT_RANGE, 10),
+    (FaultFlags::VTS_SOLENOID_HW, 21),
+    (FaultFlags::VTP_OIL_PRESSURE, 22),
+    (FaultFlags::KNOCK_SENSOR, 23),
+    (FaultFlags::OVERBOOST_CUT, 31),
+    (FaultFlags::LEAN_BOOST_CUT, 32),
+    (FaultFlags::WIDEBAND_FAULT, 41),
+];
+
+const MIL_LONG_ON_MS: u16 = 800;
+const MIL_LONG_OFF_MS: u16 = 300;
+const MIL_SHORT_ON_MS: u16 = 250;
+const MIL_SHORT_OFF_MS: u16 = 250;
+const MIL_INTER_CODE_OFF_MS: u16 = 1_400;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MilBlinkPhase {
+    Idle,
+    LongOn,
+    LongOff,
+    ShortOn,
+    ShortOff,
+    InterCodePause,
+}
+
+/// Honda OBD1 `A13 MIL` + `D4 SCS` 2-digit diagnostic lamp state machine.
+#[derive(Debug, Clone, Copy)]
+struct HondaMilBlinker {
+    last_fault_bits: u32,
+    table_cursor: usize,
+    long_remaining: u8,
+    short_remaining: u8,
+    phase: MilBlinkPhase,
+    phase_ms: u16,
+}
+
+impl HondaMilBlinker {
+    const fn new() -> Self {
+        Self {
+            last_fault_bits: 0,
+            table_cursor: 0,
+            long_remaining: 0,
+            short_remaining: 0,
+            phase: MilBlinkPhase::Idle,
+            phase_ms: 0,
+        }
+    }
+
+    fn reset(&mut self) {
+        self.last_fault_bits = 0;
+        self.table_cursor = 0;
+        self.long_remaining = 0;
+        self.short_remaining = 0;
+        self.phase = MilBlinkPhase::Idle;
+        self.phase_ms = 0;
+    }
+
+    fn load_next_code(&mut self, faults: FaultFlags) {
+        let len = MIL_CODE_TABLE.len();
+        let mut chosen_code = 1u8;
+        for offset in 0..len {
+            let idx = (self.table_cursor + offset) % len;
+            let (bit, code) = MIL_CODE_TABLE[idx];
+            if faults.contains(bit) {
+                chosen_code = code;
+                self.table_cursor = (idx + 1) % len;
+                break;
+            }
+        }
+        self.long_remaining = chosen_code / 10;
+        self.short_remaining = chosen_code % 10;
+        self.phase = if self.long_remaining > 0 {
+            MilBlinkPhase::LongOn
+        } else {
+            MilBlinkPhase::ShortOn
+        };
+        self.phase_ms = 0;
+    }
+
+    fn update_1khz(&mut self, uptime_ms: u32, faults: FaultFlags, scs_jumper: bool) -> bool {
+        if uptime_ms <= 2_000 {
+            self.reset();
+            return true;
+        }
+        if !scs_jumper {
+            self.reset();
+            return !faults.is_empty();
+        }
+        // OEM Honda OBD1 convention: `D4 SCS` bridged with zero stored faults holds MIL solid ON.
+        if faults.is_empty() {
+            self.reset();
+            return true;
+        }
+        if self.last_fault_bits != faults.0 || self.phase == MilBlinkPhase::Idle {
+            self.last_fault_bits = faults.0;
+            self.table_cursor = 0;
+            self.load_next_code(faults);
+        }
+
+        let lamp_on = matches!(self.phase, MilBlinkPhase::LongOn | MilBlinkPhase::ShortOn);
+        self.phase_ms = self.phase_ms.saturating_add(1);
+
+        match self.phase {
+            MilBlinkPhase::LongOn => {
+                if self.phase_ms >= MIL_LONG_ON_MS {
+                    self.long_remaining = self.long_remaining.saturating_sub(1);
+                    self.phase_ms = 0;
+                    self.phase = if self.long_remaining == 0 && self.short_remaining == 0 {
+                        MilBlinkPhase::InterCodePause
+                    } else {
+                        MilBlinkPhase::LongOff
+                    };
+                }
+            }
+            MilBlinkPhase::LongOff => {
+                if self.phase_ms >= MIL_LONG_OFF_MS {
+                    self.phase_ms = 0;
+                    self.phase = if self.long_remaining > 0 {
+                        MilBlinkPhase::LongOn
+                    } else {
+                        MilBlinkPhase::ShortOn
+                    };
+                }
+            }
+            MilBlinkPhase::ShortOn => {
+                if self.phase_ms >= MIL_SHORT_ON_MS {
+                    self.short_remaining = self.short_remaining.saturating_sub(1);
+                    self.phase_ms = 0;
+                    self.phase = if self.short_remaining > 0 {
+                        MilBlinkPhase::ShortOff
+                    } else {
+                        MilBlinkPhase::InterCodePause
+                    };
+                }
+            }
+            MilBlinkPhase::ShortOff => {
+                if self.phase_ms >= MIL_SHORT_OFF_MS {
+                    self.phase_ms = 0;
+                    self.phase = MilBlinkPhase::ShortOn;
+                }
+            }
+            MilBlinkPhase::InterCodePause => {
+                if self.phase_ms >= MIL_INTER_CODE_OFF_MS {
+                    self.load_next_code(faults);
+                }
+            }
+            MilBlinkPhase::Idle => {}
+        }
+
+        lamp_on
+    }
+}
+
 pub struct EngineCoordinator {
     pub trigger: HondaObd1Decoder,
     pub sensors_proc: SensorProcessor,
@@ -190,6 +351,7 @@ pub struct EngineCoordinator {
     seq: u32,
     last_angle_deg_x10: u16,
     fan_on_latched: bool,
+    mil_blinker: HondaMilBlinker,
     timing_override_deg_x10: Option<i16>,
     output_mask: OutputEnableMask,
     runtime_cut_mask: OutputEnableMask,
@@ -227,6 +389,7 @@ impl EngineCoordinator {
             seq: 0,
             last_angle_deg_x10: 0,
             fan_on_latched: false,
+            mil_blinker: HondaMilBlinker::new(),
             timing_override_deg_x10: None,
             output_mask: OutputEnableMask::all_enabled(),
             runtime_cut_mask: OutputEnableMask::all_enabled(),
@@ -261,7 +424,7 @@ impl EngineCoordinator {
                 fan_relay_on: false,
                 ac_clutch_relay_on: false,
                 mil_lamp_on: false,
-                iacv_duty_per_mille: 350,
+                iacv_duty_per_mille: 0,
                 lsu_heater_duty_per_mille: 0,
                 lsu_ip_dac_code: 2048,
             },
@@ -488,12 +651,14 @@ impl EngineCoordinator {
 
         // 5. Turbo Boost Control, Overboost/Lean-Boost Safety, Flex Trims, 2-Step & FFS
         let table_target_lambda = self.fuel.lookup_target_lambda(rpm, sensors.map_kpa, cal);
+        let in_rpm_cut = rpm >= cal.rev_limit_soft_rpm;
         let boost_out = self.boost.update_1khz(
             self.trigger.sync_state(),
             rpm,
             &sensors,
             &self.flex_state,
             max_knock_retard,
+            in_rpm_cut,
             self.wideband.state(),
             self.wideband.lambda(),
             table_target_lambda,
@@ -526,6 +691,7 @@ impl EngineCoordinator {
             cal,
             boost_out.fuel_multiplier,
             boost_out.allow_negative_stft,
+            boost_out.suppress_stft,
             boost_out.hard_cut_all,
         );
 
@@ -548,7 +714,7 @@ impl EngineCoordinator {
             cal,
         );
 
-        // 6. Auxiliary Honda OBD1 Connector A Relays & IACV
+        // 8. Auxiliary Honda OBD1 Connector A Relays & IACV
         // `A7/A8 FLR`: Prime fuel pump for 2.0 s at key-on, then hold ON whenever engine is
         // turning or cranking (or during a KOEO fuel-pump test prime)!
         if rpm > 0 {
@@ -574,8 +740,14 @@ impl EngineCoordinator {
             && (600..=6_200).contains(&rpm)
             && sensors.tps_pct < 82.0;
 
-        // `A9 IACV` (`450 Hz` PWM): Warmup base curve + idle-up adders for A/C (`+8%`) & power
-        // steering (`+4%`)
+        // `A12 FANC*` runs whenever ECT hysteresis is latched, A/C clutch is active (condenser
+        // airflow), or `ECT_RANGE` failsafe is active.
+        let fan_relay_on = self.fan_on_latched
+            || ac_clutch_relay_on
+            || self.latest_faults.contains(FaultFlags::ECT_RANGE);
+
+        // `A9 IACV` (`450 Hz` PWM): De-energized at KOEO (`RPM == 0 && !cranking`) to avoid coil
+        // heating & audible hum; warmup curve + A/C (`+8%`) & power steering (`+4%`) while running.
         let mut iacv_duty = interp_1d_i16_u16(
             &cal.ect_bins_c,
             &cal.iacv_base_duty_per_mille,
@@ -587,19 +759,19 @@ impl EngineCoordinator {
         if sensors.switches.psp_steering_load {
             iacv_duty += 40.0;
         }
-
-        // `A13 MIL`: Key-on 2.0 s bulb check, solid ON if fault active (or blink when SCS jumped)
-        let mil_lamp_on = if self.uptime_ms <= 2_000 {
-            true
-        } else if !self.latest_faults.is_empty() {
-            if sensors.switches.scs_service_jumper {
-                (self.uptime_ms / 400).is_multiple_of(2)
-            } else {
-                true
-            }
+        let iacv_duty_per_mille = if rpm == 0 && !sensors.switches.sts_cranking {
+            0
         } else {
-            false
+            iacv_duty.clamp(0.0, 950.0) as u16
         };
+
+        // `A13 MIL`: Key-on 2.0 s bulb check, solid ON if fault active (or real Honda OBD1 2-digit
+        // blink codes / zero-fault solid ON when `D4 SCS` service jumper is bridged).
+        let mil_lamp_on = self.mil_blinker.update_1khz(
+            self.uptime_ms,
+            self.latest_faults,
+            sensors.switches.scs_service_jumper,
+        );
 
         let eff_mask = self.effective_output_mask();
         let masked_pw_us = apply_inj_mask(fuel_out.final_pw_us, eff_mask);
@@ -613,10 +785,10 @@ impl EngineCoordinator {
             cop_dwell_us,
             vts_high_side_on,
             fuel_pump_relay_on,
-            fan_relay_on: self.fan_on_latched,
+            fan_relay_on,
             ac_clutch_relay_on,
             mil_lamp_on,
-            iacv_duty_per_mille: iacv_duty.clamp(0.0, 950.0) as u16,
+            iacv_duty_per_mille,
             lsu_heater_duty_per_mille: self.wideband.heater_duty_per_mille(),
             lsu_ip_dac_code: self.wideband.ip_dac_code(),
         };
@@ -747,7 +919,7 @@ mod tests {
         assert!(act.fuel_pump_relay_on);
         assert!(act.mil_lamp_on);
 
-        // 2. Tick 2,001 with engine still stopped: fuel pump relay & MIL both turn OFF!
+        // 2. Tick 2,001 with engine still stopped: fuel pump, MIL, and KOEO IACV are OFF!
         act = ecu.tick_1khz(
             2_001_000,
             &warm_adc,
@@ -758,18 +930,26 @@ mod tests {
         );
         assert!(!act.fuel_pump_relay_on);
         assert!(!act.mil_lamp_on);
-        let base_iacv = act.iacv_duty_per_mille;
+        assert_eq!(act.iacv_duty_per_mille, 0);
 
-        // 3. Starter cranking (`sts_cranking`) + A/C request + power steering load
+        // 3. Starter cranking (`sts_cranking`) energizes IACV, plus A/C (+8%) & PSP (+4%) idle-up
+        let sw_crank = SwitchState {
+            sts_cranking: true,
+            ..Default::default()
+        };
+        let crank_base = ecu
+            .tick_1khz(2_002_000, &warm_adc, sw_crank, 0.0, false, &cal)
+            .iacv_duty_per_mille;
+        assert!(crank_base > 0);
         let sw_load = SwitchState {
             sts_cranking: true,
             acs_ac_request: true,
             psp_steering_load: true,
             ..Default::default()
         };
-        act = ecu.tick_1khz(2_002_000, &warm_adc, sw_load, 0.0, false, &cal);
+        act = ecu.tick_1khz(2_003_000, &warm_adc, sw_load, 0.0, false, &cal);
         assert!(act.fuel_pump_relay_on);
-        assert_eq!(act.iacv_duty_per_mille, base_iacv + 120);
+        assert_eq!(act.iacv_duty_per_mille, crank_base + 120);
 
         // 4. Radiator fan hysteresis: heat ECT > 93 °C (0.32V -> ~98 °C) -> latches ON,
         //    holds ON at ~91 °C (0.39V), and turns OFF below 89 °C (0.50V -> ~82 °C)
@@ -890,6 +1070,7 @@ mod tests {
         assert_eq!(snap.rpm, 2_500);
         assert!(snap.actuators.inj_pw_us[0] > 1_500);
         assert!(snap.actuators.ac_clutch_relay_on);
+        assert!(snap.actuators.fan_relay_on);
         assert_eq!(spark_fires, 4);
         assert_eq!(inj_fires, 4);
 
@@ -905,6 +1086,7 @@ mod tests {
             act = ecu.tick_1khz(ts_us, &wot_adc, ac_sw, 60.0, false, &cal);
         }
         assert!(!act.ac_clutch_relay_on);
+        assert!(!act.fan_relay_on);
         assert_eq!(act.spark_advance_deg_x10, 160);
 
         // Advance past the 2,000 ms key-on prime window, then simulate stall (> 400 ms no CKP)
@@ -1176,5 +1358,80 @@ mod tests {
         assert!(!ecu.effective_output_mask().injectors_enabled);
         assert!(ecu.snapshot().faults.contains(FaultFlags::OVERBOOST_CUT));
         assert_eq!(ecu.boost_telemetry().solenoid_duty_per_mille, 0);
+    }
+
+    #[test]
+    fn honda_obd1_mil_blinker_emits_two_digit_codes_and_ect_fault_runs_fan() {
+        use super::{HondaMilBlinker, MIL_LONG_ON_MS, MIL_SHORT_ON_MS};
+
+        // 1. SCS jumper with zero faults holds MIL solid ON (OEM Honda diagnostic check).
+        let mut blinker = HondaMilBlinker::new();
+        for ms in 2_001..=2_500 {
+            assert!(blinker.update_1khz(ms, FaultFlags(0), true));
+        }
+
+        // 2. SCS jumper with Code 3 (MAP_RANGE) + Code 21 (VTS_SOLENOID_HW) emits exact pulse
+        //    widths: 3 short (250 ms), then 2 long (800 ms) + 1 short (250 ms), then repeats.
+        let mut faults = FaultFlags(0);
+        faults.insert(FaultFlags::MAP_RANGE);
+        faults.insert(FaultFlags::VTS_SOLENOID_HW);
+
+        let mut on_runs = [0u16; 8];
+        let mut run_count = 0usize;
+        let mut cur_run = 0u16;
+        for ms in 2_501..9_500u32 {
+            let on = blinker.update_1khz(ms, faults, true);
+            if on {
+                cur_run += 1;
+            } else if cur_run > 0 {
+                if run_count < on_runs.len() {
+                    on_runs[run_count] = cur_run;
+                    run_count += 1;
+                }
+                cur_run = 0;
+            }
+        }
+        assert!(
+            run_count >= 6,
+            "Expected at least 6 flashes, got {run_count}"
+        );
+        assert_eq!(
+            &on_runs[..6],
+            &[
+                MIL_SHORT_ON_MS,
+                MIL_SHORT_ON_MS,
+                MIL_SHORT_ON_MS,
+                MIL_LONG_ON_MS,
+                MIL_LONG_ON_MS,
+                MIL_SHORT_ON_MS,
+            ]
+        );
+
+        // 3. Open-circuit Stage 2 PCB ECT sensor (`4.639 V` on `2.49k` + `32k` divider) latches
+        //    `ECT_RANGE` and forces `A12 FANC*` radiator fan ON despite `80 °C` limp substitute.
+        let cal = CalibrationBlob::default_honda_obd1();
+        let mut ecu = EngineCoordinator::new();
+        let mut open_ect_adc = nominal_raw_adc(0.45, 0.45);
+        open_ect_adc.ect_raw = volts_5v_to_adc(5.0 * (32.0 / 34.49));
+        let mut act = ecu.tick_1khz(
+            1_000,
+            &open_ect_adc,
+            SwitchState::default(),
+            0.0,
+            false,
+            &cal,
+        );
+        for tick in 2..=60u32 {
+            act = ecu.tick_1khz(
+                tick * 1_000,
+                &open_ect_adc,
+                SwitchState::default(),
+                0.0,
+                false,
+                &cal,
+            );
+        }
+        assert!(ecu.snapshot().faults.contains(FaultFlags::ECT_RANGE));
+        assert!(act.fan_relay_on);
     }
 }

@@ -367,11 +367,133 @@ pub fn decode_frame<T: for<'de> Deserialize<'de>>(frame: &[u8]) -> Result<T, Pro
 pub const MAX_RUNTIME_CONFIG_BYTES: usize = 1_024;
 
 #[derive(Deserialize)]
+#[cfg_attr(test, derive(Serialize))]
 struct RuntimeConfigV1 {
     magic: u32,
     version: u16,
     knock: KnockConfig,
     aux: AuxIoConfig,
+}
+
+#[derive(Deserialize)]
+#[cfg_attr(test, derive(Serialize))]
+struct BoostConfigV2 {
+    mode: BoostMode,
+    solenoid_freq_hz: u16,
+    invert_solenoid: bool,
+    min_duty_per_mille: u16,
+    max_duty_per_mille: u16,
+    spool_duty_per_mille: u16,
+    spool_margin_kpa: f32,
+    min_tps_pct: f32,
+    full_tps_pct: f32,
+    min_rpm: u16,
+    min_ect_c: f32,
+    rpm_bins: [u16; 8],
+    base_duty_per_mille: [u16; 8],
+    target_map_kpa: [u16; 8],
+    pid_kp_x100: u16,
+    pid_ki_x100: u16,
+    pid_kd_x100: u16,
+    pid_authority_per_mille: u16,
+    flex_comp_enabled: bool,
+    flex_boost_adder_kpa: f32,
+    traction_boost_enabled: bool,
+    traction_low_vss_kmh: f32,
+    traction_high_vss_kmh: f32,
+    traction_max_map_kpa: f32,
+    overboost_cut_enabled: bool,
+    overboost_cut_kpa: f32,
+    overboost_hyst_kpa: f32,
+    cold_overboost_cut_kpa: f32,
+    knock_drop_enabled: bool,
+    knock_drop_retard_deg_x10: i16,
+    lean_prot_enabled: bool,
+    lean_min_map_kpa: f32,
+    lean_max_lambda_err: f32,
+    lean_delay_ms: u16,
+    stft_max_map_kpa: f32,
+    launch_enabled: bool,
+    launch_rpm: u16,
+    launch_window_rpm: u16,
+    launch_max_vss_kmh: f32,
+    launch_min_tps_pct: f32,
+    launch_retard_deg_x10: i16,
+    launch_fuel_enrich_pct: u8,
+    launch_boost_duty_per_mille: u16,
+    ffs_enabled: bool,
+    ffs_min_rpm: u16,
+    ffs_rpm_drop: u16,
+    ffs_min_tps_pct: f32,
+    ffs_retard_deg_x10: i16,
+    ffs_max_duration_ms: u16,
+}
+
+impl BoostConfigV2 {
+    fn into_v3(self) -> BoostConfig {
+        BoostConfig {
+            mode: self.mode,
+            solenoid_freq_hz: self.solenoid_freq_hz,
+            invert_solenoid: self.invert_solenoid,
+            min_duty_per_mille: self.min_duty_per_mille,
+            max_duty_per_mille: self.max_duty_per_mille,
+            spool_duty_per_mille: self.spool_duty_per_mille,
+            spool_margin_kpa: self.spool_margin_kpa,
+            min_tps_pct: self.min_tps_pct,
+            full_tps_pct: self.full_tps_pct,
+            min_rpm: self.min_rpm,
+            min_ect_c: self.min_ect_c,
+            rpm_bins: self.rpm_bins,
+            base_duty_per_mille: self.base_duty_per_mille,
+            target_map_kpa: self.target_map_kpa,
+            pid_kp_x100: self.pid_kp_x100,
+            pid_ki_x100: self.pid_ki_x100,
+            pid_kd_x100: self.pid_kd_x100,
+            pid_authority_per_mille: self.pid_authority_per_mille,
+            flex_comp_enabled: self.flex_comp_enabled,
+            flex_boost_adder_kpa: self.flex_boost_adder_kpa,
+            traction_boost_enabled: self.traction_boost_enabled,
+            traction_low_vss_kmh: self.traction_low_vss_kmh,
+            traction_high_vss_kmh: self.traction_high_vss_kmh,
+            traction_max_map_kpa: self.traction_max_map_kpa,
+            overboost_cut_enabled: self.overboost_cut_enabled,
+            overboost_cut_kpa: self.overboost_cut_kpa,
+            overboost_hyst_kpa: self.overboost_hyst_kpa,
+            cold_overboost_cut_kpa: self.cold_overboost_cut_kpa,
+            knock_drop_enabled: self.knock_drop_enabled,
+            knock_drop_retard_deg_x10: self.knock_drop_retard_deg_x10,
+            lean_prot_enabled: self.lean_prot_enabled,
+            lean_min_map_kpa: self.lean_min_map_kpa,
+            lean_max_lambda_err: self.lean_max_lambda_err,
+            lean_delay_ms: self.lean_delay_ms,
+            stft_max_map_kpa: self.stft_max_map_kpa,
+            launch_enabled: self.launch_enabled,
+            launch_rpm: self.launch_rpm,
+            launch_window_rpm: self.launch_window_rpm,
+            launch_max_vss_kmh: self.launch_max_vss_kmh,
+            launch_min_tps_pct: self.launch_min_tps_pct,
+            launch_retard_deg_x10: self.launch_retard_deg_x10,
+            launch_fuel_enrich_pct: self.launch_fuel_enrich_pct,
+            launch_boost_duty_per_mille: self.launch_boost_duty_per_mille,
+            ffs_enabled: self.ffs_enabled,
+            ffs_min_rpm: self.ffs_min_rpm,
+            ffs_rpm_drop: self.ffs_rpm_drop,
+            ffs_min_tps_pct: self.ffs_min_tps_pct,
+            ffs_retard_deg_x10: self.ffs_retard_deg_x10,
+            ffs_max_duration_ms: self.ffs_max_duration_ms,
+            clutch_invert: false,
+        }
+    }
+}
+
+#[derive(Deserialize)]
+#[cfg_attr(test, derive(Serialize))]
+struct RuntimeConfigV2 {
+    magic: u32,
+    version: u16,
+    knock: KnockConfig,
+    aux: AuxIoConfig,
+    boost: BoostConfigV2,
 }
 
 /// Serializes a [`RuntimeConfigBlob`] with `postcard` into `out`, returning written length.
@@ -382,12 +504,24 @@ pub fn encode_runtime_config(cfg: &RuntimeConfigBlob, out: &mut [u8]) -> Result<
 }
 
 /// Deserializes and header-validates a persisted [`RuntimeConfigBlob`], transparently migrating
-/// legacy v1 blobs (`KnockConfig` + `AuxIoConfig`) with default [`BoostConfig`].
+/// legacy v1 (`Knock + Aux`) and v2 (`BoostConfig` without `clutch_invert`) blobs to v3.
 pub fn decode_runtime_config(bytes: &[u8]) -> Option<RuntimeConfigBlob> {
     if let Ok(cfg) = postcard::from_bytes::<RuntimeConfigBlob>(bytes)
         && cfg.validate_header()
     {
         return Some(cfg);
+    }
+    if let Ok(v2) = postcard::from_bytes::<RuntimeConfigV2>(bytes)
+        && v2.magic == RUNTIME_CONFIG_MAGIC
+        && v2.version == 2
+    {
+        return Some(RuntimeConfigBlob {
+            magic: RUNTIME_CONFIG_MAGIC,
+            version: RUNTIME_CONFIG_VERSION,
+            knock: v2.knock,
+            aux: v2.aux,
+            boost: v2.boost.into_v3(),
+        });
     }
     let v1: RuntimeConfigV1 = postcard::from_bytes(bytes).ok()?;
     (v1.magic == RUNTIME_CONFIG_MAGIC && v1.version == 1).then_some(RuntimeConfigBlob {
@@ -622,8 +756,90 @@ mod tests {
         rt_cfg.aux.iab_engage_rpm = 5_900;
         rt_cfg.boost.mode = BoostMode::ClosedLoop;
         rt_cfg.boost.launch_enabled = true;
+        rt_cfg.boost.clutch_invert = true;
         let rt_len = encode_runtime_config(&rt_cfg, &mut rt_buf).expect("encode RuntimeConfigBlob");
         assert_eq!(decode_runtime_config(&rt_buf[..rt_len]), Some(rt_cfg));
+
+        // Legacy v1 blob migrates losslessly to v3 with default BoostConfig.
+        let v1_blob = super::RuntimeConfigV1 {
+            magic: ecu_types::RUNTIME_CONFIG_MAGIC,
+            version: 1,
+            knock: rt_cfg.knock,
+            aux: rt_cfg.aux,
+        };
+        let v1_bytes = postcard::to_slice(&v1_blob, &mut rt_buf).expect("encode v1");
+        let v1_migrated = decode_runtime_config(v1_bytes).expect("migrate v1 -> v3");
+        assert_eq!(v1_migrated.version, ecu_types::RUNTIME_CONFIG_VERSION);
+        assert_eq!(v1_migrated.knock, rt_cfg.knock);
+        assert_eq!(v1_migrated.aux, rt_cfg.aux);
+        assert_eq!(v1_migrated.boost, BoostConfig::default_honda_obd1());
+
+        // Legacy v2 blob (before `clutch_invert`) migrates losslessly to v3 with
+        // `clutch_invert = false` while preserving all boost/launch settings.
+        let b = rt_cfg.boost;
+        let v2_blob = super::RuntimeConfigV2 {
+            magic: ecu_types::RUNTIME_CONFIG_MAGIC,
+            version: 2,
+            knock: rt_cfg.knock,
+            aux: rt_cfg.aux,
+            boost: super::BoostConfigV2 {
+                mode: b.mode,
+                solenoid_freq_hz: b.solenoid_freq_hz,
+                invert_solenoid: b.invert_solenoid,
+                min_duty_per_mille: b.min_duty_per_mille,
+                max_duty_per_mille: b.max_duty_per_mille,
+                spool_duty_per_mille: b.spool_duty_per_mille,
+                spool_margin_kpa: b.spool_margin_kpa,
+                min_tps_pct: b.min_tps_pct,
+                full_tps_pct: b.full_tps_pct,
+                min_rpm: b.min_rpm,
+                min_ect_c: b.min_ect_c,
+                rpm_bins: b.rpm_bins,
+                base_duty_per_mille: b.base_duty_per_mille,
+                target_map_kpa: b.target_map_kpa,
+                pid_kp_x100: b.pid_kp_x100,
+                pid_ki_x100: b.pid_ki_x100,
+                pid_kd_x100: b.pid_kd_x100,
+                pid_authority_per_mille: b.pid_authority_per_mille,
+                flex_comp_enabled: b.flex_comp_enabled,
+                flex_boost_adder_kpa: b.flex_boost_adder_kpa,
+                traction_boost_enabled: b.traction_boost_enabled,
+                traction_low_vss_kmh: b.traction_low_vss_kmh,
+                traction_high_vss_kmh: b.traction_high_vss_kmh,
+                traction_max_map_kpa: b.traction_max_map_kpa,
+                overboost_cut_enabled: b.overboost_cut_enabled,
+                overboost_cut_kpa: b.overboost_cut_kpa,
+                overboost_hyst_kpa: b.overboost_hyst_kpa,
+                cold_overboost_cut_kpa: b.cold_overboost_cut_kpa,
+                knock_drop_enabled: b.knock_drop_enabled,
+                knock_drop_retard_deg_x10: b.knock_drop_retard_deg_x10,
+                lean_prot_enabled: b.lean_prot_enabled,
+                lean_min_map_kpa: b.lean_min_map_kpa,
+                lean_max_lambda_err: b.lean_max_lambda_err,
+                lean_delay_ms: b.lean_delay_ms,
+                stft_max_map_kpa: b.stft_max_map_kpa,
+                launch_enabled: b.launch_enabled,
+                launch_rpm: b.launch_rpm,
+                launch_window_rpm: b.launch_window_rpm,
+                launch_max_vss_kmh: b.launch_max_vss_kmh,
+                launch_min_tps_pct: b.launch_min_tps_pct,
+                launch_retard_deg_x10: b.launch_retard_deg_x10,
+                launch_fuel_enrich_pct: b.launch_fuel_enrich_pct,
+                launch_boost_duty_per_mille: b.launch_boost_duty_per_mille,
+                ffs_enabled: b.ffs_enabled,
+                ffs_min_rpm: b.ffs_min_rpm,
+                ffs_rpm_drop: b.ffs_rpm_drop,
+                ffs_min_tps_pct: b.ffs_min_tps_pct,
+                ffs_retard_deg_x10: b.ffs_retard_deg_x10,
+                ffs_max_duration_ms: b.ffs_max_duration_ms,
+            },
+        };
+        let v2_bytes = postcard::to_slice(&v2_blob, &mut rt_buf).expect("encode v2");
+        let v2_migrated = decode_runtime_config(v2_bytes).expect("migrate v2 -> v3");
+        assert_eq!(v2_migrated.version, ecu_types::RUNTIME_CONFIG_VERSION);
+        assert_eq!(v2_migrated.boost.mode, BoostMode::ClosedLoop);
+        assert!(v2_migrated.boost.launch_enabled);
+        assert!(!v2_migrated.boost.clutch_invert);
 
         let boost_req = Request::SetBoostConfig {
             config: BoostConfig::default_honda_obd1(),

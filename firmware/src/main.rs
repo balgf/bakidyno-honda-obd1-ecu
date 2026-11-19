@@ -28,7 +28,7 @@ use ecu_core::aux_io::{AuxIoConfig, AuxIoController, AuxIoTelemetry};
 use ecu_core::sensors::InvertedMcuSwitchPins;
 use ecu_types::{CalibrationBlob, SyncState, WidebandState};
 use embassy_executor::Spawner;
-use embassy_stm32::gpio::{Input, Level, Output, Pull, Speed};
+use embassy_stm32::gpio::{Input, Level, Output, OutputOpenDrain, Pull, Speed};
 use embassy_stm32::interrupt::typelevel::Interrupt;
 use embassy_stm32::rcc::mux::{Adcsel, Fdcansel, Sdmmcsel, Usbsel};
 use embassy_stm32::rcc::{
@@ -175,9 +175,10 @@ async fn main(spawner: Spawner) {
     configure_nvic_priorities();
     isolate_direct_adc3_pads();
 
-    // 1. SAFETY FIRST: Hold `PB15` (`ACTUATOR_OE_N` on 3x `SN74AHCT541`) HIGH (`DISABLED`)
-    //    and initialize `SPI1` NVM (`PD6` CS# held HIGH) before loading tune!
-    let mut actuator_oe_n = Output::new(p.PB15, Level::High, Speed::Low);
+    // 1. SAFETY FIRST: Hold `PB15` (`ACTUATOR_OE_N` on 3x `SN74AHCT541`, external `5V` pull-up)
+    //    released High-Z (`DISABLED`) via open-drain so 5V never back-feeds the 3.3V rail, and
+    //    initialize `SPI1` NVM (`PD6` CS# held HIGH) before loading tune!
+    let mut actuator_oe_n = OutputOpenDrain::new(p.PB15, Level::High, Speed::Low);
     let mut nvm = NvmStorage::init(p.SPI1, p.PB3, p.PD7, p.PB4, p.PD6).await;
 
     // 2. Initialize digital outputs to safe OFF state BEFORE enabling `ACTUATOR_OE_N`

@@ -17,6 +17,11 @@ pub const SENSOR_DIVIDER_GAIN_INV: f32 = 1.600;
 pub const VBATT_DIVIDER_GAIN_INV: f32 = 115.0 / 15.0;
 /// Precision `0.1%` thermistor bias pull-up (`2490.0 Ω`).
 pub const THERMISTOR_PULLUP_OHMS: f32 = 2490.0;
+/// Minimum valid ratiometric thermistor ratio (`~150 °C` is `0.022`; `< 0.015` = shorted to GND).
+const NTC_RATIO_MIN: f32 = 0.015;
+/// Maximum valid ratiometric thermistor ratio (`-40 °C` is `0.893`; an unplugged open-circuit
+/// thermistor on our `2.49 kΩ` pull-up + `32.0 kΩ` ADC divider sits at `32.0 / 34.49 = 0.9278`).
+const NTC_RATIO_MAX: f32 = 0.915;
 
 // Exact 3-point Steinhart-Hart fit to Honda Civic Factory Service Manual NTC curve
 // (`37870-PJ7-003` D13 ECT & D15 IAT: 2500 Ω @ 20 °C, 800 Ω @ 50 °C, 220 Ω @ 90 °C):
@@ -169,7 +174,11 @@ impl SensorProcessor {
         );
         let map_raw_kpa =
             map_cal.kpa_at_0v + (map_v / 5.0) * (map_cal.kpa_at_5v - map_cal.kpa_at_0v);
-        let map_kpa = self.map_lpf.update(map_raw_kpa.clamp(10.0, 450.0));
+        let map_kpa = if self.map_bad_ticks >= RANGE_FAULT_DEBOUNCE_TICKS {
+            100.0
+        } else {
+            self.map_lpf.update(map_raw_kpa.clamp(10.0, 450.0))
+        };
 
         // 3. D11 TPS
         let tps_v = to_ratiometric_5v(raw.tps_raw);
@@ -181,30 +190,40 @@ impl SensorProcessor {
         );
         let tps_span = (self.tps_wot_v - self.tps_closed_v).max(0.5);
         let tps_raw_pct = ((tps_v - self.tps_closed_v) / tps_span * 100.0).clamp(0.0, 100.0);
-        let tps_pct = self.tps_lpf.update(tps_raw_pct);
+        let tps_pct = if self.tps_bad_ticks >= RANGE_FAULT_DEBOUNCE_TICKS {
+            0.0
+        } else {
+            self.tps_lpf.update(tps_raw_pct)
+        };
 
         // 4. D13 ECT & D15 IAT (compensating 32 kΩ parallel divider load!)
         let ect_ratio = (Self::adc_to_pin_volts(raw.ect_raw) * SENSOR_DIVIDER_GAIN_INV) / vcc_5v;
         debounce_range_fault(
-            !(0.01..=0.99).contains(&ect_ratio),
+            !(NTC_RATIO_MIN..=NTC_RATIO_MAX).contains(&ect_ratio),
             &mut self.ect_bad_ticks,
             FaultFlags::ECT_RANGE,
             faults,
         );
-        let ect_c = self
-            .ect_lpf
-            .update(Self::honda_ntc_temp_c(ect_ratio).clamp(-40.0, 150.0));
+        let ect_c = if self.ect_bad_ticks >= RANGE_FAULT_DEBOUNCE_TICKS {
+            80.0
+        } else {
+            self.ect_lpf
+                .update(Self::honda_ntc_temp_c(ect_ratio).clamp(-40.0, 150.0))
+        };
 
         let iat_ratio = (Self::adc_to_pin_volts(raw.iat_raw) * SENSOR_DIVIDER_GAIN_INV) / vcc_5v;
         debounce_range_fault(
-            !(0.01..=0.99).contains(&iat_ratio),
+            !(NTC_RATIO_MIN..=NTC_RATIO_MAX).contains(&iat_ratio),
             &mut self.iat_bad_ticks,
             FaultFlags::IAT_RANGE,
             faults,
         );
-        let iat_c = self
-            .iat_lpf
-            .update(Self::honda_ntc_temp_c(iat_ratio).clamp(-40.0, 130.0));
+        let iat_c = if self.iat_bad_ticks >= RANGE_FAULT_DEBOUNCE_TICKS {
+            30.0
+        } else {
+            self.iat_lpf
+                .update(Self::honda_ntc_temp_c(iat_ratio).clamp(-40.0, 130.0))
+        };
 
         // 5. PC4 IGP Battery Voltage (`100k / 15k` divider)
         let vbatt_raw = Self::adc_to_pin_volts(raw.vbatt_raw) * VBATT_DIVIDER_GAIN_INV;
@@ -347,13 +366,44 @@ mod tests {
         let _ = proc_5v0.process(&raw_5v0, SwitchState::default(), 0.0, &map_cal, &mut faults);
         assert!(faults.is_empty());
 
+        let mut limp = s1;
         for _ in 0..super::RANGE_FAULT_DEBOUNCE_TICKS {
-            let _ = proc_5v0.process(&shorted, SwitchState::default(), 0.0, &map_cal, &mut faults);
+            limp = proc_5v0.process(&shorted, SwitchState::default(), 0.0, &map_cal, &mut faults);
         }
         assert!(faults.contains(FaultFlags::MAP_RANGE));
         assert!(faults.contains(FaultFlags::TPS_RANGE));
         assert!(faults.contains(FaultFlags::ECT_RANGE));
         assert!(faults.contains(FaultFlags::IAT_RANGE));
+        // Active range faults substitute safe limp-home defaults to avoid cold flooding
+        assert!((limp.map_kpa - 100.0).abs() < 0.01);
+        assert!((limp.tps_pct - 0.0).abs() < 0.01);
+        assert!((limp.ect_c - 80.0).abs() < 0.01);
+        assert!((limp.iat_c - 30.0).abs() < 0.01);
+
+        // Stage 2 PCB unplugged open-circuit ECT/IAT (`2.49k` pull-up + `32k` divider = `4.639 V`,
+        // ratio `0.9278`) must also detect open circuit and substitute `80 °C` / `30 °C`!
+        let mut proc_open = SensorProcessor::new();
+        let mut open_faults = FaultFlags::default();
+        let open_ntc_v = 5.0 * (32.0 / 34.49);
+        let open_ntc = RawSensorAdc {
+            ect_raw: volts_5v_to_adc(open_ntc_v),
+            iat_raw: volts_5v_to_adc(open_ntc_v),
+            ..raw_5v0
+        };
+        let mut open_snap = s1;
+        for _ in 0..super::RANGE_FAULT_DEBOUNCE_TICKS {
+            open_snap = proc_open.process(
+                &open_ntc,
+                SwitchState::default(),
+                0.0,
+                &map_cal,
+                &mut open_faults,
+            );
+        }
+        assert!(open_faults.contains(FaultFlags::ECT_RANGE));
+        assert!(open_faults.contains(FaultFlags::IAT_RANGE));
+        assert!((open_snap.ect_c - 80.0).abs() < 0.01);
+        assert!((open_snap.iat_c - 30.0).abs() < 0.01);
     }
 
     #[test]

@@ -518,6 +518,9 @@ mod tests {
     #[test]
     fn altc_iab_evap_and_spare_outputs_follow_hysteresis_and_safety_gates() {
         let mut cfg = AuxIoConfig::default_honda_obd1();
+        // OEM P72 default energizes the IAB vacuum solenoid below crossover (`iab_invert == true`).
+        assert!(cfg.iab_invert);
+        cfg.iab_invert = false;
         cfg.pe0_mode = AuxSpareMode::ShiftLight {
             engage_rpm: 7_000,
             disengage_rpm: 6_600,

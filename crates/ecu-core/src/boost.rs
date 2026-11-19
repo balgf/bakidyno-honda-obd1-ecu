@@ -105,6 +105,8 @@ pub struct BoostControlOutput {
     pub flex_spark_add_deg_x10: i16,
     /// `false` above `stft_max_map_kpa` so wideband never pulls `-25%` fuel under boost.
     pub allow_negative_stft: bool,
+    /// `true` while 2-step launch, FFS, or hard safety cut is active so STFT doesn't wind up.
+    pub suppress_stft: bool,
     pub telemetry: BoostTelemetry,
 }
 
@@ -190,6 +192,7 @@ impl BoostController {
         sensors: &SensorSnapshot,
         flex: &FlexFuelState,
         max_knock_retard_deg_x10: i16,
+        in_rpm_cut: bool,
         wbo_state: WidebandState,
         measured_lambda: f32,
         target_lambda: f32,
@@ -255,49 +258,28 @@ impl BoostController {
             self.overboost_clear_ms = 0;
         }
 
-        // 4. Lean-Under-Boost Safety Cut (`WidebandState::ClosedLoopReady` required).
-        if cfg.lean_prot_enabled
-            && wbo_state == WidebandState::ClosedLoopReady
-            && rpm >= cfg.min_rpm
-            && !map_fault
-            && sensors.map_kpa >= cfg.lean_min_map_kpa
-        {
-            if measured_lambda > target_lambda + cfg.lean_max_lambda_err {
-                self.lean_fault_ms = self.lean_fault_ms.saturating_add(1);
-                if self.lean_fault_ms >= cfg.lean_delay_ms {
-                    self.lean_cut_latched = true;
-                    faults.insert(FaultFlags::LEAN_BOOST_CUT);
-                }
-            } else {
-                self.lean_fault_ms = 0;
-            }
-        } else {
-            self.lean_fault_ms = 0;
-        }
+        // 4. 2-Step Launch Control & Flat-Foot Shift (`PE12 B7 CLUTCH` + `PB11 B10 VSS`).
+        //    Evaluated before lean-boost protection so intentional spark cuts never falsely trip
+        //    `FaultFlags::LEAN_BOOST_CUT` from unburned exhaust oxygen.
         if self.lean_cut_latched && (rpm == 0 || sensors.tps_pct < 15.0) {
             self.lean_cut_latched = false;
         }
-
-        let hard_cut_all = self.overboost_cut_latched || self.lean_cut_latched;
-        let knock_drop_active =
-            cfg.knock_drop_enabled && max_knock_retard_deg_x10 >= cfg.knock_drop_retard_deg_x10;
-
-        // 5. 2-Step Launch Control & Flat-Foot Shift (`PE12 B7 CLUTCH` + `PB11 B10 VSS`).
+        let pre_hard_cut = self.overboost_cut_latched || self.lean_cut_latched;
         let engine_running =
             sync_state == SyncState::FullSynced720 && rpm >= 400 && !sensors.switches.sts_cranking;
-        let clutch_now = sensors.switches.clutch_pressed;
+        let clutch_now = sensors.switches.clutch_pressed ^ cfg.clutch_invert;
         let clutch_rising = clutch_now && !self.prev_clutch_pressed;
         self.prev_clutch_pressed = clutch_now;
 
         let launch_armed = cfg.launch_enabled
             && engine_running
-            && !hard_cut_all
+            && !pre_hard_cut
             && clutch_now
             && sensors.vss_kmh <= cfg.launch_max_vss_kmh
             && sensors.tps_pct >= cfg.launch_min_tps_pct
             && rpm >= 1_500;
 
-        if !clutch_now || sensors.tps_pct < cfg.ffs_min_tps_pct || !engine_running || hard_cut_all {
+        if !clutch_now || sensors.tps_pct < cfg.ffs_min_tps_pct || !engine_running || pre_hard_cut {
             self.ffs_latched = false;
             self.ffs_timer_ms = 0;
         } else if cfg.ffs_enabled
@@ -318,15 +300,14 @@ impl BoostController {
         let mut spark_blend_target = None;
         let mut cyl_spark_enabled = [true; 4];
         let mut launch_fuel_mult = 1.0f32;
-        let launch_active;
-        let ffs_active;
+        let mut launch_active = false;
+        let mut ffs_active = false;
 
         if launch_armed {
             let win = cfg.launch_window_rpm.max(50) as f32;
             let start_rpm = cfg.launch_rpm.saturating_sub(cfg.launch_window_rpm) as f32;
             let ramp = ((rpm as f32 - start_rpm) / win).clamp(0.0, 1.0);
             launch_active = ramp > 0.0;
-            ffs_active = false;
             if ramp > 0.0 {
                 spark_blend_target = Some((cfg.launch_retard_deg_x10, ramp));
                 launch_fuel_mult = 1.0 + (cfg.launch_fuel_enrich_pct as f32 * 0.01 * ramp);
@@ -337,7 +318,6 @@ impl BoostController {
                 cyl_spark_enabled = self.next_rotating_spark_mask(cut_frac);
             }
         } else if self.ffs_latched {
-            launch_active = false;
             ffs_active = true;
             spark_blend_target = Some((cfg.ffs_retard_deg_x10, 1.0));
             if rpm >= self.ffs_target_rpm {
@@ -345,10 +325,40 @@ impl BoostController {
                 let cut_frac = (0.5 + (over / 200.0) * 0.5).clamp(0.5, 1.0);
                 cyl_spark_enabled = self.next_rotating_spark_mask(cut_frac);
             }
+        }
+
+        // 5. Lean-Under-Boost Safety Cut (inhibited during intentional spark/rev cuts).
+        let intentional_cut = launch_active || ffs_active || in_rpm_cut;
+        if cfg.lean_prot_enabled
+            && !intentional_cut
+            && wbo_state == WidebandState::ClosedLoopReady
+            && rpm >= cfg.min_rpm
+            && !map_fault
+            && sensors.map_kpa >= cfg.lean_min_map_kpa
+        {
+            if measured_lambda > target_lambda + cfg.lean_max_lambda_err {
+                self.lean_fault_ms = self.lean_fault_ms.saturating_add(1);
+                if self.lean_fault_ms >= cfg.lean_delay_ms {
+                    self.lean_cut_latched = true;
+                    faults.insert(FaultFlags::LEAN_BOOST_CUT);
+                }
+            } else {
+                self.lean_fault_ms = 0;
+            }
         } else {
+            self.lean_fault_ms = 0;
+        }
+
+        let hard_cut_all = self.overboost_cut_latched || self.lean_cut_latched;
+        if hard_cut_all {
             launch_active = false;
             ffs_active = false;
+            spark_blend_target = None;
+            cyl_spark_enabled = [false; 4];
+            launch_fuel_mult = 1.0;
         }
+        let knock_drop_active =
+            cfg.knock_drop_enabled && max_knock_retard_deg_x10 >= cfg.knock_drop_retard_deg_x10;
 
         // 6. Electronic Boost Solenoid Target & PID/Feedforward Duty (`PE1` / `A19 BOOST`).
         let mut target_kpa = interp_1d_u16(&cfg.rpm_bins, &cfg.target_map_kpa, rpm as f32);
@@ -468,6 +478,7 @@ impl BoostController {
             fuel_multiplier,
             flex_spark_add_deg_x10,
             allow_negative_stft,
+            suppress_stft: launch_active || ffs_active || hard_cut_all,
             telemetry,
         }
     }
@@ -579,6 +590,7 @@ mod tests {
                 &ko_sns,
                 &e0,
                 0,
+                false,
                 WidebandState::WaitForEngine,
                 1.0,
                 1.0,
@@ -603,6 +615,7 @@ mod tests {
             &low_spd,
             &e85,
             0,
+            false,
             WidebandState::ClosedLoopReady,
             0.82,
             0.82,
@@ -625,6 +638,7 @@ mod tests {
                 &hi_spd,
                 &e85,
                 0,
+                false,
                 WidebandState::ClosedLoopReady,
                 0.80,
                 0.80,
@@ -660,6 +674,7 @@ mod tests {
             &over,
             &e0,
             0,
+            false,
             WidebandState::ClosedLoopReady,
             0.80,
             0.80,
@@ -667,6 +682,7 @@ mod tests {
             &cfg,
         );
         assert!(out.hard_cut_all);
+        assert!(out.suppress_stft);
         assert_eq!(out.solenoid_duty_per_mille, 0);
         assert!(faults.contains(FaultFlags::OVERBOOST_CUT));
 
@@ -680,6 +696,7 @@ mod tests {
                 &safe,
                 &e0,
                 0,
+                false,
                 WidebandState::ClosedLoopReady,
                 0.80,
                 0.80,
@@ -697,6 +714,7 @@ mod tests {
             &boost_ok,
             &e0,
             40,
+            false,
             WidebandState::ClosedLoopReady,
             0.80,
             0.80,
@@ -706,7 +724,26 @@ mod tests {
         assert!(knk.telemetry.knock_drop_active);
         assert_eq!(knk.solenoid_duty_per_mille, 0);
 
-        // 3. Lean under boost (0.95 vs 0.80 target) for 50 ms latches LEAN_BOOST_CUT
+        // 3. Apparent lean wideband reading during soft/hard RPM rev-limit cut is inhibited
+        for _ in 0..100 {
+            let rev_cut = ctrl.update_1khz(
+                SyncState::FullSynced720,
+                7_400,
+                &boost_ok,
+                &e0,
+                0,
+                true,
+                WidebandState::ClosedLoopReady,
+                1.60,
+                0.80,
+                &mut faults,
+                &cfg,
+            );
+            assert!(!rev_cut.hard_cut_all);
+        }
+        assert!(!faults.contains(FaultFlags::LEAN_BOOST_CUT));
+
+        // 4. Genuine lean under boost (0.95 vs 0.80 target) for 50 ms latches LEAN_BOOST_CUT
         let mut lean = knk;
         for _ in 0..55 {
             lean = ctrl.update_1khz(
@@ -715,6 +752,7 @@ mod tests {
                 &boost_ok,
                 &e0,
                 0,
+                false,
                 WidebandState::ClosedLoopReady,
                 0.95,
                 0.80,
@@ -740,31 +778,55 @@ mod tests {
         cfg.ffs_min_rpm = 5_000;
         cfg.ffs_rpm_drop = 400;
         cfg.ffs_max_duration_ms = 500;
+        cfg.lean_prot_enabled = true;
+        cfg.lean_min_map_kpa = 140.0;
+        cfg.lean_delay_ms = 20;
         let mut faults = FaultFlags::default();
         let e0 = FlexFuelState::new();
 
-        // 1. Stationary clutch pressed + WOT @ 4,600 RPM -> 2-step active, rotating spark cut
-        let launch_sns = warm_boost_sensors(115.0, 85.0, 0.0, true);
-        let l1 = ctrl.update_1khz(
+        // 1. Stationary clutch pressed + WOT @ 4,600 RPM -> 2-step active, rotating spark cut,
+        //    and unburned-O2 lean spikes on wideband never false-trip LEAN_BOOST_CUT!
+        let launch_sns = warm_boost_sensors(155.0, 85.0, 0.0, true);
+        let mut l1 = ctrl.update_1khz(
             SyncState::FullSynced720,
             4_600,
             &launch_sns,
             &e0,
             0,
+            false,
             WidebandState::ClosedLoopReady,
-            0.85,
+            1.60,
             0.85,
             &mut faults,
             &cfg,
         );
+        for _ in 0..40 {
+            l1 = ctrl.update_1khz(
+                SyncState::FullSynced720,
+                4_600,
+                &launch_sns,
+                &e0,
+                0,
+                false,
+                WidebandState::ClosedLoopReady,
+                1.60,
+                0.85,
+                &mut faults,
+                &cfg,
+            );
+        }
         assert!(l1.telemetry.launch_active);
         assert!(!l1.telemetry.ffs_active);
+        assert!(!l1.hard_cut_all);
+        assert!(l1.suppress_stft);
+        assert!(!faults.contains(FaultFlags::LEAN_BOOST_CUT));
         assert_eq!(l1.spark_blend_target, Some((-40, 1.0)));
         assert!((l1.fuel_multiplier - 1.12).abs() < 0.01);
         assert!(l1.cyl_spark_enabled.iter().any(|&on| !on));
         assert!(l1.solenoid_duty_per_mille >= cfg.launch_boost_duty_per_mille);
 
         // 2. Release clutch, roll at 95 km/h, then clutch in @ 7,200 RPM -> FFS holds ~6,800 RPM
+        //    and also suppresses false LEAN_BOOST_CUT trips!
         let roll_off = warm_boost_sensors(165.0, 95.0, 95.0, false);
         let _ = ctrl.update_1khz(
             SyncState::FullSynced720,
@@ -772,6 +834,7 @@ mod tests {
             &roll_off,
             &e0,
             0,
+            false,
             WidebandState::ClosedLoopReady,
             0.82,
             0.82,
@@ -779,21 +842,46 @@ mod tests {
             &cfg,
         );
         let ffs_sns = warm_boost_sensors(160.0, 95.0, 95.0, true);
-        let ffs = ctrl.update_1khz(
+        let mut ffs = l1;
+        for _ in 0..40 {
+            ffs = ctrl.update_1khz(
+                SyncState::FullSynced720,
+                7_200,
+                &ffs_sns,
+                &e0,
+                0,
+                false,
+                WidebandState::ClosedLoopReady,
+                1.60,
+                0.82,
+                &mut faults,
+                &cfg,
+            );
+        }
+        assert!(ffs.telemetry.ffs_active);
+        assert!(!ffs.telemetry.launch_active);
+        assert!(!ffs.hard_cut_all);
+        assert!(ffs.suppress_stft);
+        assert!(!faults.contains(FaultFlags::LEAN_BOOST_CUT));
+        assert_eq!(ffs.spark_blend_target, Some((50, 1.0)));
+        assert!(ffs.cyl_spark_enabled.iter().any(|&on| !on));
+
+        // 3. Honda NC upper cruise clutch switch (`clutch_invert = true`): raw false = pressed!
+        cfg.clutch_invert = true;
+        let nc_pressed = warm_boost_sensors(115.0, 85.0, 0.0, false);
+        let nc_out = ctrl.update_1khz(
             SyncState::FullSynced720,
-            7_200,
-            &ffs_sns,
+            4_600,
+            &nc_pressed,
             &e0,
             0,
+            false,
             WidebandState::ClosedLoopReady,
-            0.82,
-            0.82,
+            0.85,
+            0.85,
             &mut faults,
             &cfg,
         );
-        assert!(ffs.telemetry.ffs_active);
-        assert!(!ffs.telemetry.launch_active);
-        assert_eq!(ffs.spark_blend_target, Some((50, 1.0)));
-        assert!(ffs.cyl_spark_enabled.iter().any(|&on| !on));
+        assert!(nc_out.telemetry.launch_active);
     }
 }

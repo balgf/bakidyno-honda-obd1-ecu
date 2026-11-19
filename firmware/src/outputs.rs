@@ -386,6 +386,8 @@ impl<'d> HardwareOutputs<'d> {
             Hertz(450),
             CountingMode::EdgeAlignedUp,
         );
+        tim4_pwm.ch3().set_duty_cycle_fraction(0, 1_000);
+        tim4_pwm.ch4().set_duty_cycle_fraction(0, 1_000);
         tim4_pwm.ch3().enable();
         tim4_pwm.ch4().enable();
 

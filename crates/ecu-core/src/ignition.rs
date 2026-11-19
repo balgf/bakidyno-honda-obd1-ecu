@@ -79,8 +79,7 @@ impl IgnitionToothScheduler {
         mask: OutputEnableMask,
     ) -> ToothScheduleBatch {
         let mut batch = ToothScheduleBatch::default();
-        if tooth.sync_state != SyncState::FullSynced720 || tooth.rpm == 0 || !mask.ignition_enabled
-        {
+        if tooth.sync_state != SyncState::FullSynced720 || tooth.rpm == 0 {
             self.reset_cycle();
             return batch;
         }
@@ -94,11 +93,7 @@ impl IgnitionToothScheduler {
 
         for &cyl in &HONDA_FIRING_ORDER {
             let idx = cyl.index();
-            if !mask.is_cop_enabled(cyl) {
-                self.dwell_scheduled_in_cycle[idx] = false;
-                self.spark_scheduled_in_cycle[idx] = false;
-                continue;
-            }
+            let cyl_enabled = mask.is_cop_enabled(cyl);
             let tdc_x10 = CYLINDER_TDC_DEG_X10[idx] as i32;
             let reset_x10 = (tdc_x10 + IGN_RESET_OFFSET_FROM_TDC_X10).rem_euclid(7200) as u16;
             if angle_offset_in_tooth_window(tooth.crank_angle_deg_x10, reset_x10).is_some() {
@@ -106,12 +101,15 @@ impl IgnitionToothScheduler {
                 self.spark_scheduled_in_cycle[idx] = false;
                 continue;
             }
+            if !cyl_enabled && !self.dwell_scheduled_in_cycle[idx] {
+                continue;
+            }
 
             let cyl_adv_x10 = (spark_advance_deg_x10 - per_cyl_knock_retard_deg_x10[idx]) as i32;
             let spark_angle_x10 = (tdc_x10 - cyl_adv_x10).rem_euclid(7200) as u16;
             let dwell_start_x10 = (spark_angle_x10 as i32 - dwell_deg_x10).rem_euclid(7200) as u16;
 
-            if !self.dwell_scheduled_in_cycle[idx] {
+            if cyl_enabled && !self.dwell_scheduled_in_cycle[idx] {
                 if let Some(d_deg) =
                     angle_offset_in_tooth_window(tooth.crank_angle_deg_x10, dwell_start_x10)
                 {
@@ -143,7 +141,11 @@ impl IgnitionToothScheduler {
                 }
             }
 
-            if !self.spark_scheduled_in_cycle[idx] {
+            // Always release any coil whose dwell already began before a mid-cycle spark cut so
+            // it never over-dwells into the 9.5 ms hardware watchdog.
+            if !self.spark_scheduled_in_cycle[idx]
+                && (cyl_enabled || self.dwell_scheduled_in_cycle[idx])
+            {
                 if let Some(s_deg) =
                     angle_offset_in_tooth_window(tooth.crank_angle_deg_x10, spark_angle_x10)
                 {
@@ -531,5 +533,61 @@ mod tests {
                 .all(|a| a.cylinder != Cylinder::Cyl1),
             "Cyl1 must not start dwell retroactively after passing spark angle"
         );
+    }
+
+    #[test]
+    fn mid_cycle_spark_cut_releases_already_started_dwell_and_blocks_next_cycle() {
+        let mut ign = IgnitionModel::new();
+        let all_on = ecu_types::OutputEnableMask::all_enabled();
+        let mut cut_all = ecu_types::OutputEnableMask::all_enabled();
+        cut_all.ignition_enabled = false;
+
+        // 6,000 RPM (`833 µs` per `30°`), `25.0° BTDC`, `2.8 ms` (`100.8°`) dwell:
+        // Cyl 1 starts dwell at `594.2°` (tooth 19, `570..600°`) and sparks at `695.0°` (tooth 23).
+        let mut cyl1_dwell_started = false;
+        let mut cyl1_spark_released = false;
+        for tooth_idx in 0..24u8 {
+            let mask = if cyl1_dwell_started { cut_all } else { all_on };
+            let ev = CkpToothEvent {
+                sync_state: SyncState::FullSynced720,
+                tooth_index: tooth_idx,
+                crank_angle_deg_x10: tooth_idx as u16 * 300,
+                tooth_period_us: 833,
+                rpm: 6_000,
+                timestamp_us: tooth_idx as u32 * 833,
+            };
+            let batch = ign.schedule_on_ckp_tooth_masked(&ev, 250, 2_800, mask);
+            for act in batch.actions.iter().flatten() {
+                if act.cylinder == Cylinder::Cyl1 {
+                    if act.drive_dwell_high {
+                        cyl1_dwell_started = true;
+                    } else {
+                        cyl1_spark_released = true;
+                    }
+                }
+            }
+        }
+        assert!(cyl1_dwell_started, "Cyl1 should start dwell before the cut");
+        assert!(
+            cyl1_spark_released,
+            "Mid-cycle cut must still release Cyl1 dwell at spark angle instead of over-dwelling"
+        );
+
+        // Next full 720° cycle with cut still active must schedule zero dwell and zero spark!
+        for tooth_idx in 0..24u8 {
+            let ev = CkpToothEvent {
+                sync_state: SyncState::FullSynced720,
+                tooth_index: tooth_idx,
+                crank_angle_deg_x10: tooth_idx as u16 * 300,
+                tooth_period_us: 833,
+                rpm: 6_000,
+                timestamp_us: 20_000 + tooth_idx as u32 * 833,
+            };
+            let batch = ign.schedule_on_ckp_tooth_masked(&ev, 250, 2_800, cut_all);
+            assert_eq!(
+                batch.len, 0,
+                "Sustained spark cut must not start any new dwell on tooth {tooth_idx}"
+            );
+        }
     }
 }

@@ -536,8 +536,8 @@ pub struct KnockTelemetry {
 
 /// Magic header identifying a valid persisted `RuntimeConfigBlob` (`"CIKA"`).
 pub const RUNTIME_CONFIG_MAGIC: u32 = 0x4349_4b41;
-/// Schema version for persisted [`RuntimeConfigBlob`].
-pub const RUNTIME_CONFIG_VERSION: u16 = 2;
+/// Schema version for persisted [`RuntimeConfigBlob`] (`v3` adds `BoostConfig::clutch_invert`).
+pub const RUNTIME_CONFIG_VERSION: u16 = 3;
 
 /// Operating mode for configurable spare low-side driver outputs (`PE0`, `PE1`).
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
@@ -618,7 +618,7 @@ impl AuxIoConfig {
             altc_eld_hyst_amps: 22.0,
             altc_wot_unload_tps_pct: 75.0,
             iab_enabled: true,
-            iab_invert: false,
+            iab_invert: true,
             iab_engage_rpm: 5_750,
             iab_disengage_rpm: 5_500,
             evap_enabled: true,
@@ -895,6 +895,8 @@ pub struct BoostConfig {
     pub ffs_retard_deg_x10: i16,
     /// Maximum continuous flat-foot shift duration (`ms`) per clutch press.
     pub ffs_max_duration_ms: u16,
+    /// Inverts `B7` (`PE12`) clutch switch logic (`true` for NC Honda upper cruise clutch switch).
+    pub clutch_invert: bool,
 }
 
 impl Default for BoostConfig {
@@ -957,6 +959,7 @@ impl BoostConfig {
             ffs_min_tps_pct: 80.0,
             ffs_retard_deg_x10: 50,
             ffs_max_duration_ms: 900,
+            clutch_invert: false,
         }
     }
 }

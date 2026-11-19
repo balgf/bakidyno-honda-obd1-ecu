@@ -94,7 +94,9 @@ impl Tim2TriggerHw {
         }
     }
 
-    /// Unmasks `TIM2` (`Priority::P1`) `CH1` (`CKP`) interrupts once initial calibration is loaded.
+    /// Unmasks `TIM2` (`Priority::P1`) `CH1..CH4` (`CKP`, `TDC`, `CYP`, `VSS`) interrupts once
+    /// initial calibration is loaded so `VSS` updates even at `RPM == 0` and `TDC`/`CYP` capture
+    /// on their exact hardware edges.
     pub fn arm_irq(&self) {
         pac::TIM2.sr().write(|_| {});
         interrupt::typelevel::TIM2::set_priority(interrupt::Priority::P1);
@@ -104,8 +106,9 @@ impl Tim2TriggerHw {
         unsafe {
             interrupt::typelevel::TIM2::enable();
         }
-        self.tim2
-            .enable_input_interrupt(Channel::Ch1, /* enable= */ true);
+        for ch in [Channel::Ch1, Channel::Ch2, Channel::Ch3, Channel::Ch4] {
+            self.tim2.enable_input_interrupt(ch, /* enable= */ true);
+        }
     }
 }
 
@@ -127,11 +130,27 @@ impl interrupt::typelevel::Handler<interrupt::typelevel::TIM2> for Tim2TriggerIn
         let cyp_ts_us = sr.ccif(2).then(|| regs.ccr(2).read());
         let vss_ts_us = sr.ccif(3).then(|| regs.ccr(3).read());
 
-        regs.sr().modify(|w| {
-            for ch in 0..4 {
-                w.set_ccof(ch, /* val= */ false);
-            }
-        });
+        // `TIM2->SR` is `rc_w0` (write `0` to clear, `1` to leave untouched): issue a single
+        // atomic write with only `CC1OF..CC4OF` cleared so concurrent `CCxIF` edges are never lost.
+        let mut clear_of = pac::timer::regs::SrGp16(!0u32);
+        for ch in 0..4 {
+            clear_of.set_ccof(ch, /* val= */ false);
+        }
+        regs.sr().write_value(clear_of);
+
+        // Order coincident `CYP`/`TDC` and `CKP` captures by true 32-bit `TIM2` timestamp so
+        // fractional tooth-boundary phase stays strictly chronological.
+        let is_before_or_eq = |a: u32, b: u32| (a.wrapping_sub(b) as i32) <= 0;
+        let cyp_before_ckp = match (cyp_ts_us, ckp_ts_us) {
+            (Some(cyp_ts), Some(ckp_ts)) => is_before_or_eq(cyp_ts, ckp_ts),
+            (Some(_), None) => true,
+            _ => false,
+        };
+        let tdc_before_ckp = match (tdc_ts_us, ckp_ts_us) {
+            (Some(tdc_ts), Some(ckp_ts)) => is_before_or_eq(tdc_ts, ckp_ts),
+            (Some(_), None) => true,
+            _ => false,
+        };
 
         let (outputs, knock_plan, synced) = critical_section::with(|cs| {
             let mut dom = RT_DOMAIN.borrow(cs).borrow_mut();
@@ -146,10 +165,10 @@ impl interrupt::typelevel::Handler<interrupt::typelevel::TIM2> for Tim2TriggerIn
                 dom.last_vss_ts_us = Some(vss_ts);
             }
 
-            if let Some(cyp_ts) = cyp_ts_us {
+            if cyp_before_ckp && let Some(cyp_ts) = cyp_ts_us {
                 dom.engine.on_cyp_capture(cyp_ts);
             }
-            if let Some(tdc_ts) = tdc_ts_us {
+            if tdc_before_ckp && let Some(tdc_ts) = tdc_ts_us {
                 dom.engine.on_tdc_capture(tdc_ts);
             }
 
@@ -158,6 +177,13 @@ impl interrupt::typelevel::Handler<interrupt::typelevel::TIM2> for Tim2TriggerIn
             } else {
                 (Default::default(), None)
             };
+
+            if !cyp_before_ckp && let Some(cyp_ts) = cyp_ts_us {
+                dom.engine.on_cyp_capture(cyp_ts);
+            }
+            if !tdc_before_ckp && let Some(tdc_ts) = tdc_ts_us {
+                dom.engine.on_tdc_capture(tdc_ts);
+            }
 
             (outputs, knock_plan, dom.engine.is_full_synced())
         });

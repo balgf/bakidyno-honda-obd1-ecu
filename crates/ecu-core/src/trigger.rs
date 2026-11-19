@@ -86,6 +86,11 @@ pub struct HondaObd1Decoder {
     cyp_armed: bool,
     tdc_edges_since_cyp: u8,
     ckp_teeth_since_tdc: u8,
+    ckp_teeth_since_cyp: u8,
+    last_tdc_frac_milli: Option<i32>,
+    last_tdc_dt_since_ckp_us: Option<i32>,
+    last_cyp_frac_milli: Option<i32>,
+    last_cyp_dt_since_ckp_us: Option<i32>,
     last_ckp_ts_us: Option<u32>,
     prev_period_us: u32,
     rpm: u16,
@@ -106,11 +111,54 @@ impl HondaObd1Decoder {
             cyp_armed: false,
             tdc_edges_since_cyp: 0,
             ckp_teeth_since_tdc: 0,
+            ckp_teeth_since_cyp: 0,
+            last_tdc_frac_milli: None,
+            last_tdc_dt_since_ckp_us: None,
+            last_cyp_frac_milli: None,
+            last_cyp_dt_since_ckp_us: None,
             last_ckp_ts_us: None,
             prev_period_us: 0,
             rpm: 0,
             sync_loss_count: 0,
         }
+    }
+
+    #[inline]
+    fn reset_phase_tracking(&mut self) {
+        self.tdc_edges_since_cyp = 0;
+        self.ckp_teeth_since_tdc = 0;
+        self.ckp_teeth_since_cyp = 0;
+        self.last_tdc_frac_milli = None;
+        self.last_tdc_dt_since_ckp_us = None;
+        self.last_cyp_frac_milli = None;
+        self.last_cyp_dt_since_ckp_us = None;
+    }
+
+    #[inline]
+    fn frac_milli_since_last_ckp(&self, timestamp_us: u32) -> (Option<i32>, Option<i32>) {
+        let Some(last_ckp) = self.last_ckp_ts_us else {
+            return (None, None);
+        };
+        let dt_us = timestamp_us.wrapping_sub(last_ckp) as i32;
+        if self.prev_period_us > 0 {
+            let frac =
+                ((dt_us as i64 * 1_000) / self.prev_period_us as i64).clamp(-500, 1_500) as i32;
+            (Some(frac), Some(dt_us))
+        } else {
+            (None, Some(dt_us))
+        }
+    }
+
+    #[inline]
+    fn resolve_prev_frac(&self, prev_frac: Option<i32>, prev_dt: Option<i32>) -> Option<i32> {
+        if prev_frac.is_some() {
+            return prev_frac;
+        }
+        let dt_us = prev_dt?;
+        if self.prev_period_us == 0 {
+            return None;
+        }
+        Some(((dt_us as i64 * 1_000) / self.prev_period_us as i64).clamp(-500, 1_500) as i32)
     }
 
     #[inline]
@@ -140,6 +188,7 @@ impl HondaObd1Decoder {
         {
             self.sync_state = SyncState::Unsynced;
             self.cyp_armed = false;
+            self.reset_phase_tracking();
             self.last_ckp_ts_us = None;
             self.prev_period_us = 0;
             self.rpm = 0;
@@ -148,29 +197,60 @@ impl HondaObd1Decoder {
 
     /// Called from `TIM2_CH3` (`PB10 CYP`) ISR — 1 pulse per `720°` cam revolution.
     #[inline]
-    pub fn on_cyp_capture(&mut self, _timestamp_us: u32, faults: &mut FaultFlags) {
+    pub fn on_cyp_capture(&mut self, timestamp_us: u32, faults: &mut FaultFlags) {
+        let (cur_frac, cur_dt) = self.frac_milli_since_last_ckp(timestamp_us);
+        let mut reanchor = true;
         if self.sync_state == SyncState::FullSynced720 {
-            // Verify that exactly 24 CKP teeth elapsed since the previous CYP pulse!
-            // Because CYP arrives just before tooth 0, `tooth_index` should be `23` (last tooth).
-            if self.tooth_index != 23 {
+            // Verify continuous CKP tooth spacing is `24.00 ± 0.35` teeth (`720° ± 10.5°`) so
+            // sub-tooth VR zero-crossing jitter across a CKP edge never falsely trips sync loss.
+            let prev_frac =
+                self.resolve_prev_frac(self.last_cyp_frac_milli, self.last_cyp_dt_since_ckp_us);
+            let spacing_ok = match (prev_frac, cur_frac) {
+                (Some(pf), Some(cf)) => {
+                    let exact_milli = (self.ckp_teeth_since_cyp as i32) * 1_000 + cf - pf;
+                    (23_650..=24_350).contains(&exact_milli)
+                }
+                _ => self.ckp_teeth_since_cyp == CKP_TEETH_PER_720,
+            };
+            if !spacing_ok {
                 self.sync_loss_count = self.sync_loss_count.saturating_add(1);
                 faults.insert(FaultFlags::CKP_SYNC_LOSS);
+            } else if self.tooth_index != CKP_TEETH_PER_720 - 1 {
+                // Keep existing 24-tooth CKP grid phase lock when CYP jitters slightly across a
+                // CKP boundary without losing true 720° spacing.
+                reanchor = false;
             }
         }
-        self.cyp_armed = true;
+        self.cyp_armed = reanchor;
+        self.ckp_teeth_since_cyp = 0;
+        self.last_cyp_frac_milli = cur_frac;
+        self.last_cyp_dt_since_ckp_us = cur_dt;
         self.tdc_edges_since_cyp = 0;
     }
 
     /// Called from `TIM2_CH2` (`PA1 TDC`) ISR — 4 pulses per `720°` (`180°` / `6` `CKP` teeth).
     #[inline]
-    pub fn on_tdc_capture(&mut self, _timestamp_us: u32, faults: &mut FaultFlags) {
+    pub fn on_tdc_capture(&mut self, timestamp_us: u32, faults: &mut FaultFlags) {
+        let (cur_frac, cur_dt) = self.frac_milli_since_last_ckp(timestamp_us);
         if self.sync_state == SyncState::FullSynced720 && self.tdc_edges_since_cyp > 0 {
-            // Between consecutive TDC pulses we must see exactly 6 CKP teeth (`6 * 30° = 180°`).
-            if self.ckp_teeth_since_tdc != 6 {
+            // Between consecutive TDC pulses we expect `6.00 ± 0.35` CKP teeth (`180° ± 10.5°`),
+            // tolerating discrete `5`/`7` counts caused by VR jitter across a coincident CKP edge.
+            let prev_frac =
+                self.resolve_prev_frac(self.last_tdc_frac_milli, self.last_tdc_dt_since_ckp_us);
+            let spacing_ok = match (prev_frac, cur_frac) {
+                (Some(pf), Some(cf)) => {
+                    let exact_milli = (self.ckp_teeth_since_tdc as i32) * 1_000 + cf - pf;
+                    (5_650..=6_350).contains(&exact_milli)
+                }
+                _ => self.ckp_teeth_since_tdc == 6,
+            };
+            if !spacing_ok {
                 faults.insert(FaultFlags::TDC_SENSOR);
             }
         }
         self.ckp_teeth_since_tdc = 0;
+        self.last_tdc_frac_milli = cur_frac;
+        self.last_tdc_dt_since_ckp_us = cur_dt;
         self.tdc_edges_since_cyp = self.tdc_edges_since_cyp.saturating_add(1);
         if self.sync_state == SyncState::Unsynced && self.last_ckp_ts_us.is_some() {
             self.sync_state = SyncState::HalfSynced360;
@@ -198,6 +278,8 @@ impl HondaObd1Decoder {
         // If engine paused > 350 ms between teeth, treat as a fresh crank start
         if dt_us > 350_000 {
             self.sync_state = SyncState::Unsynced;
+            self.cyp_armed = false;
+            self.reset_phase_tracking();
             self.prev_period_us = 0;
             self.last_ckp_ts_us = Some(timestamp_us);
             return None;
@@ -212,6 +294,8 @@ impl HondaObd1Decoder {
                 self.sync_loss_count = self.sync_loss_count.saturating_add(1);
                 faults.insert(FaultFlags::CKP_SYNC_LOSS);
                 self.sync_state = SyncState::Unsynced;
+                self.cyp_armed = false;
+                self.reset_phase_tracking();
                 self.prev_period_us = dt_us;
                 self.last_ckp_ts_us = Some(timestamp_us);
                 return None;
@@ -221,6 +305,7 @@ impl HondaObd1Decoder {
         self.last_ckp_ts_us = Some(timestamp_us);
         self.prev_period_us = dt_us;
         self.ckp_teeth_since_tdc = self.ckp_teeth_since_tdc.saturating_add(1);
+        self.ckp_teeth_since_cyp = self.ckp_teeth_since_cyp.saturating_add(1);
 
         if self.cyp_armed {
             self.tooth_index = 0;
@@ -383,5 +468,61 @@ mod tests {
         }
         assert_eq!(batch.len, 4);
         assert_eq!(batch.actions, [Some(0), Some(1), Some(2), Some(3)]);
+    }
+
+    #[test]
+    fn tdc_and_cyp_sub_tooth_boundary_jitter_produces_zero_false_faults() {
+        let mut dec = HondaObd1Decoder::new();
+        let mut faults = FaultFlags::default();
+        let dt: u32 = 2_000; // 2,500 RPM (`2,000 µs` per 30.0° CKP tooth)
+        let mut ts: u32 = 50_000;
+
+        assert!(dec.on_ckp_capture(ts, 0, &mut faults).is_none());
+
+        // Simulate TDC mechanically coincident with every 6th CKP tooth, alternating `-30 µs`
+        // (just before tooth `6k`) and `+30 µs` (just after tooth `6k`), yielding discrete
+        // `ckp_teeth_since_tdc` counts of `7, 5, 7, 5` while true spacing is `180° ± 0.9°`!
+        let mut tdc_after_next = false;
+        for _cycle in 0..3u8 {
+            for tooth in 0..24u8 {
+                if tooth == 0 {
+                    dec.on_cyp_capture(ts + 1_000, &mut faults);
+                }
+                let tdc_slot = tooth.is_multiple_of(6);
+                if tdc_slot && !tdc_after_next {
+                    // Arrives 30 µs BEFORE this CKP tooth (i.e. `1,970 µs` after previous CKP)
+                    dec.on_tdc_capture(ts + dt - 30, &mut faults);
+                }
+                ts += dt;
+                let ev = dec
+                    .on_ckp_capture(ts, 0, &mut faults)
+                    .expect("expected valid CKP tooth");
+                assert_eq!(ev.tooth_index, tooth);
+                if tdc_slot && tdc_after_next {
+                    // Arrives 30 µs AFTER this CKP tooth
+                    dec.on_tdc_capture(ts + 30, &mut faults);
+                }
+                if tdc_slot {
+                    tdc_after_next = !tdc_after_next;
+                }
+            }
+        }
+        assert!(
+            faults.is_empty(),
+            "Sub-tooth TDC boundary jitter must not latch faults: {faults:?}"
+        );
+        assert_eq!(dec.sync_loss_count(), 0);
+
+        // Now inject a genuine 1-tooth-early TDC error (`5.0` teeth = `150°`) -> MUST fault!
+        for tooth in 0..5u8 {
+            if tooth == 0 {
+                dec.on_cyp_capture(ts + 1_000, &mut faults);
+                dec.on_tdc_capture(ts + dt - 30, &mut faults);
+            }
+            ts += dt;
+            let _ = dec.on_ckp_capture(ts, 0, &mut faults);
+        }
+        dec.on_tdc_capture(ts + dt - 30, &mut faults);
+        assert!(faults.contains(FaultFlags::TDC_SENSOR));
     }
 }
